@@ -1,0 +1,107 @@
+nameOverride: ""
+fullnameOverride: ""
+imagePullSecrets: []
+
+server:
+  replicas: 1
+  image:
+    repository: docker.io/benjaminhuo/ax-server
+    tag: latest
+    digest: ""
+    pullPolicy: Always
+  service:
+    type: ClusterIP
+    port: 8080
+  serviceAccount:
+    create: true
+    # Empty uses <chart fullname>-server, normally ax-server.
+    name: ""
+  rbac:
+    # AX resolves model Secrets in the namespace named by each Task's atespace.
+    create: true
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+  podAnnotations: {}
+  extraEnv: []
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+taskRunner:
+  image:
+    repository: docker.io/benjaminhuo/ax-task-runner
+    tag: latest
+    # Required: the published linux/amd64 + linux/arm64 image index digest.
+    # The kagent Substrate fork rejects ActorTemplate images without a digest.
+    digest: ""
+
+substrate:
+  namespace: ate-system
+  apiService: api
+  apiPort: 443
+  # Empty derives dns:///<apiService>.<namespace>.svc:<apiPort>.
+  endpoint: ""
+  # Empty derives <apiService>.<namespace>.svc for TLS SNI and gRPC authority.
+  authority: ""
+  auth:
+    # Empty uses the authority; matches kagent's Kubernetes JWT provider.
+    audience: ""
+    expirationSeconds: 7200
+  tls:
+    signerName: servicedns.podcert.ate.dev/identity
+    trustBundleSelector:
+      matchLabels:
+        podcert.ate.dev/canarying: live
+    # Alternative to ClusterTrustBundle projection, in the AX release namespace.
+    caConfigMap: ""
+    caKey: trust-bundle.pem
+  router:
+    service: atenet-router
+    port: 80
+    # Empty derives <service>.<namespace>.svc:<port>, without http://.
+    address: ""
+  # Must match the Substrate release's ateApi.snapshotLocation.
+  snapshotLocation: s3://ate-snapshots/
+  defaultTemplate: default-template
+  # Empty uses the AX release namespace. AX creates per-task templates itself.
+  templateAtespace: ""
+  networkPolicy:
+    # Add a scoped allow rule in the existing Substrate namespace.
+    # Disable if the operator already allows AX (e.g. ate.dev/api-access=true).
+    create: true
+    apiPodSelector:
+      matchLabels:
+        app: ate-api-server
+
+redis:
+  enabled: true
+  image:
+    repository: docker.io/library/redis
+    tag: 7-alpine
+    digest: ""
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+  persistence:
+    # Keep AX's task, workspace and model state across Redis Pod restarts.
+    enabled: true
+    existingClaim: ""
+    size: 1Gi
+    # Empty uses the default StorageClass; "-" requests no StorageClass.
+    storageClass: ""
+  external:
+    # Required host:port when redis.enabled=false.
+    address: ""
+    passwordSecret:
+      name: ""
+      key: password

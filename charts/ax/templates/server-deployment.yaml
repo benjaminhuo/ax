@@ -1,0 +1,120 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ax.fullname" . }}-server
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ax.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.server.replicas }}
+  selector:
+    matchLabels:
+      {{- include "ax.serverSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "ax.serverSelectorLabels" . | nindent 8 }}
+      {{- with .Values.server.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "ax.serviceAccountName" . }}
+      # Model Secret lookup also needs the normal Kubernetes API token and CA.
+      automountServiceAccountToken: true
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: ax-server
+          image: {{ include "ax.image" .Values.server.image | quote }}
+          imagePullPolicy: {{ .Values.server.image.pullPolicy }}
+          args:
+            - "--addr=:8080"
+            - {{ printf "--redis-addr=%s" (include "ax.redisAddress" .) | quote }}
+            - {{ printf "--substrate-endpoint=%s" (include "ax.substrateEndpoint" .) | quote }}
+            - {{ printf "--substrate-authority=%s" (include "ax.substrateAuthority" .) | quote }}
+            - "--substrate-token-file=/var/run/secrets/ateapi/token"
+            - "--substrate-ca-file=/run/servicedns-ca/trust-bundle.pem"
+            - {{ printf "--template=%s" .Values.substrate.defaultTemplate | quote }}
+            - {{ printf "--template-atespace=%s" (default .Release.Namespace .Values.substrate.templateAtespace) | quote }}
+          env:
+            - name: AX_DEFAULT_TASK_IMAGE
+              value: {{ include "ax.runnerImage" . | quote }}
+            - name: ATENET_ROUTER_ADDR
+              value: {{ include "ax.routerAddress" . | quote }}
+            - name: AX_SNAPSHOTS_BUCKET
+              value: {{ .Values.substrate.snapshotLocation | quote }}
+            {{- if and (not .Values.redis.enabled) .Values.redis.external.passwordSecret.name }}
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.redis.external.passwordSecret.name }}
+                  key: {{ .Values.redis.external.passwordSecret.key }}
+            {{- end }}
+            {{- with .Values.server.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - containerPort: 8080
+              name: http
+          resources:
+            {{- toYaml .Values.server.resources | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - mountPath: /var/run/secrets/ateapi
+              name: ate-token
+              readOnly: true
+            - mountPath: /run/servicedns-ca
+              name: servicedns-ca
+              readOnly: true
+      volumes:
+        - name: ate-token
+          projected:
+            defaultMode: 420
+            sources:
+              - serviceAccountToken:
+                  audience: {{ include "ax.substrateAudience" . | quote }}
+                  expirationSeconds: {{ .Values.substrate.auth.expirationSeconds }}
+                  path: token
+        - name: servicedns-ca
+          {{- if .Values.substrate.tls.caConfigMap }}
+          configMap:
+            name: {{ .Values.substrate.tls.caConfigMap }}
+            items:
+              - key: {{ .Values.substrate.tls.caKey }}
+                path: trust-bundle.pem
+          {{- else }}
+          projected:
+            defaultMode: 420
+            sources:
+              - clusterTrustBundle:
+                  signerName: {{ .Values.substrate.tls.signerName }}
+                  labelSelector:
+                    {{- toYaml .Values.substrate.tls.trustBundleSelector | nindent 20 }}
+                  path: trust-bundle.pem
+          {{- end }}
+      {{- with .Values.server.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.server.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.server.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

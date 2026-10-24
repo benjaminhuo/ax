@@ -1,0 +1,9 @@
+# Merge into the EXISTING Substrate release, retaining its other owners/settings.
+# These are Substrate chart values, not AX chart values.
+ateApi:
+  snapshotLocation: s3://ate-snapshots/
+  authorization:
+    bootstrapOwners:
+      - spiffe://cluster.local/ns/kagent/sa/kagent-controller
+      # Change namespace/ServiceAccount if the AX release uses different names.
+      - system:serviceaccount:ax-system:ax-server

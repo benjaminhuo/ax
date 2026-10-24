@@ -1,0 +1,23 @@
+AX control plane: {{ .Release.Namespace }}/{{ include "ax.fullname" . }}-server
+
+Substrate API: {{ include "ax.substrateEndpoint" . }}
+JWT principal: system:serviceaccount:{{ .Release.Namespace }}:{{ include "ax.serviceAccountName" . }}
+Snapshot URI: {{ .Values.substrate.snapshotLocation }}
+Runner image: {{ include "ax.runnerImage" . }}
+
+Grant this JWT principal Substrate global owner permissions before submitting tasks.
+The Kubernetes Secret ClusterRole does not grant Substrate API access.
+See this chart's README for the kagent Substrate values and AX SDK compatibility prerequisite.
+Pod readiness alone does not validate task execution or snapshot storage.
+
+Connect:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "ax.fullname" . }}-server 8080:{{ .Values.server.service.port }}
+  ax --server=http://127.0.0.1:8080 get tasks
+
+{{- if .Values.redis.enabled }}
+{{- if .Values.redis.persistence.enabled }}
+Redis persistence is enabled. Chart-created PVCs are retained on uninstall.
+{{- else }}
+Redis persistence is disabled. Replacing its Pod loses AX control-plane state.
+{{- end }}
+{{- end }}

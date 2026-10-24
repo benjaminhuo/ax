@@ -90,6 +90,8 @@ make deploy AX_IMAGE_REPO=<your-registry>
 
 This deploys Redis, then builds and deploys the control plane images with `ko`. Everything lands in the `ax-system` namespace.
 
+For Helm deployment with prebuilt images and the kagent Substrate fork, see the [AX Helm chart](charts/ax/README.md).
+
 ### 3. Run your first task
 
 ```bash

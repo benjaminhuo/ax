@@ -1,0 +1,70 @@
+{{- if .Values.redis.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ax.fullname" . }}-redis
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ax.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  # A single Redis process owns the AOF; a rolling update cannot share it.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "ax.redisSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "ax.redisSelectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: redis
+          image: {{ include "ax.image" .Values.redis.image | quote }}
+          imagePullPolicy: {{ .Values.redis.image.pullPolicy }}
+          {{- if .Values.redis.persistence.enabled }}
+          args: ["--appendonly", "yes", "--dir", "/data"]
+          {{- end }}
+          ports:
+            - containerPort: 6379
+              name: redis
+          resources:
+            {{- toYaml .Values.redis.resources | nindent 12 }}
+          readinessProbe:
+            tcpSocket:
+              port: redis
+          livenessProbe:
+            tcpSocket:
+              port: redis
+          {{- if .Values.redis.persistence.enabled }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          {{- end }}
+      {{- if .Values.redis.persistence.enabled }}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ default (printf "%s-redis" (include "ax.fullname" .)) .Values.redis.persistence.existingClaim }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ax.fullname" . }}-redis
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ax.labels" . | nindent 4 }}
+spec:
+  ports:
+    - port: 6379
+      name: redis
+      targetPort: redis
+  selector:
+    {{- include "ax.redisSelectorLabels" . | nindent 4 }}
+{{- end }}

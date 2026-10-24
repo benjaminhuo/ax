@@ -1,0 +1,9 @@
+apiVersion: v2
+name: ax
+description: AX control plane for the kagent Substrate fork and RustFS
+type: application
+version: 0.1.0
+appVersion: "latest"
+home: https://github.com/benjaminhuo/ax
+sources:
+  - https://github.com/benjaminhuo/ax
