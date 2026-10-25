@@ -33,6 +33,11 @@ server:
   affinity: {}
 
 taskRunner:
+  # Applied to each task's sandbox, separately from server.resources.
+  defaultResources:
+    cpu: "1"
+    memory: 1Gi
+  wakeupTimeoutSeconds: 900
   image:
     repository: docker.io/benjaminhuo/ax-task-runner
     tag: latest
@@ -65,8 +70,15 @@ substrate:
     port: 80
     # Empty derives <service>.<namespace>.svc:<port>, without http://.
     address: ""
-  # Must match the Substrate release's ateApi.snapshotLocation.
+  # Required on each ActorTemplate by Substrate v0.6.0-alpha3.
   snapshotLocation: s3://ate-snapshots/
+  workerPool:
+    name: kagent-default
+    namespace: kagent
+  egress:
+    # Origins allowed before resume. Empty denies all outbound traffic/DNS.
+    # https:// uses MITM with a projected CA; tls:// uses TLS passthrough.
+    allowedOrigins: []
   defaultTemplate: default-template
   # Empty uses the AX release namespace. AX creates per-task templates itself.
   templateAtespace: ""

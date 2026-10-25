@@ -37,6 +37,12 @@ spec:
             - {{ printf "--substrate-authority=%s" (include "ax.substrateAuthority" .) | quote }}
             - "--substrate-token-file=/var/run/secrets/ateapi/token"
             - "--substrate-ca-file=/run/servicedns-ca/trust-bundle.pem"
+            - {{ printf "--default-task-cpu=%s" .Values.taskRunner.defaultResources.cpu | quote }}
+            - {{ printf "--default-task-memory=%s" .Values.taskRunner.defaultResources.memory | quote }}
+            - {{ printf "--task-wakeup-timeout-seconds=%v" .Values.taskRunner.wakeupTimeoutSeconds | quote }}
+            - {{ printf "--worker-pool-name=%s" .Values.substrate.workerPool.name | quote }}
+            - {{ printf "--worker-pool-namespace=%s" .Values.substrate.workerPool.namespace | quote }}
+            - {{ printf "--egress-allow-origins=%s" (join "," .Values.substrate.egress.allowedOrigins) | quote }}
             - {{ printf "--template=%s" .Values.substrate.defaultTemplate | quote }}
             - {{ printf "--template-atespace=%s" (default .Release.Namespace .Values.substrate.templateAtespace) | quote }}
           env:
@@ -63,8 +69,9 @@ spec:
             {{- toYaml .Values.server.resources | nindent 12 }}
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /readyz
               port: http
+            timeoutSeconds: 3
             initialDelaySeconds: 2
             periodSeconds: 5
           livenessProbe:

@@ -151,6 +151,31 @@
             "tag",
             "digest"
           ]
+        },
+        "defaultResources": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "cpu",
+            "memory"
+          ],
+          "properties": {
+            "cpu": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32
+            },
+            "memory": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32
+            }
+          }
+        },
+        "wakeupTimeoutSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3600
         }
       },
       "additionalProperties": false
@@ -244,7 +269,7 @@
         },
         "snapshotLocation": {
           "type": "string",
-          "pattern": "^(s3|gs)://[^/?#]+/[^?#]*$"
+          "pattern": "^s3://[^/?#@]+/[^?#]*$"
         },
         "defaultTemplate": {
           "type": "string",
@@ -277,6 +302,41 @@
             }
           },
           "additionalProperties": false
+        },
+        "workerPool": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "name",
+            "namespace"
+          ],
+          "properties": {
+            "name": {
+              "type": "string",
+              "maxLength": 63,
+              "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+            },
+            "namespace": {
+              "type": "string",
+              "maxLength": 63,
+              "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+            }
+          }
+        },
+        "egress": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "allowedOrigins": {
+              "type": "array",
+              "maxItems": 256,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "pattern": "^(https?|tls)://[^/?#@]+/?$"
+              }
+            }
+          }
         }
       },
       "additionalProperties": false

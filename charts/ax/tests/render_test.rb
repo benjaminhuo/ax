@@ -50,6 +50,13 @@ class ChartRenderTest < Minitest::Test
     assert_includes args, "--substrate-endpoint=dns:///api.ate-system.svc:443"
     assert_includes args, "--substrate-authority=api.ate-system.svc"
     assert_includes args, "--redis-addr=ax-redis.ax-system.svc:6379"
+    assert_includes args, "--default-task-cpu=1"
+    assert_includes args, "--default-task-memory=1Gi"
+    assert_includes args, "--worker-pool-name=kagent-default"
+    assert_includes args, "--worker-pool-namespace=kagent"
+    assert_includes args, "--task-wakeup-timeout-seconds=900"
+    assert_includes args, "--egress-allow-origins="
+    assert_equal "/readyz", container(resources).dig("readinessProbe", "httpGet", "path")
     refute args.any? { |arg| arg.include?("insecure-tls") || arg.include?("plaintext") }
     assert_equal "s3://ate-snapshots/", env(resources).fetch("AX_SNAPSHOTS_BUCKET")["value"]
     assert_equal "docker.io/benjaminhuo/ax-task-runner:latest@#{DIGEST}", env(resources).fetch("AX_DEFAULT_TASK_IMAGE")["value"]
@@ -185,12 +192,31 @@ class ChartRenderTest < Minitest::Test
   end
 
   def test_invalid_connection_and_auth_values_are_rejected
-    ["substrate.snapshotLocation=http://rustfs:9000/bucket/", "substrate.auth.expirationSeconds=1", "server.replicas=0"].each do |setting|
+    ["substrate.snapshotLocation=http://rustfs:9000/bucket/", "substrate.snapshotLocation=gs://bucket/", "substrate.auth.expirationSeconds=1", "server.replicas=0", "taskRunner.wakeupTimeoutSeconds=3601", "substrate.workerPool.name=UPPERCASE"].each do |setting|
       _, stderr, status = helm(
         "template", "ax", CHART, "--set-string", "taskRunner.image.digest=#{DIGEST}", "--set", setting
       )
       refute status.success?, setting
       assert_includes stderr, setting.split("=").first.split(".").last
     end
+  end
+
+  def test_task_runtime_settings_are_passed_to_server
+    resources = render(
+      "--set-string", "taskRunner.defaultResources.cpu=500m",
+      "--set-string", "taskRunner.defaultResources.memory=2Gi",
+      "--set-string", "substrate.workerPool.name=dedicated",
+      "--set-string", "substrate.workerPool.namespace=runtime",
+      "--set", "taskRunner.wakeupTimeoutSeconds=1200",
+      "--set-string", "substrate.egress.allowedOrigins[0]=https://github.com",
+      "--set-string", "substrate.egress.allowedOrigins[1]=tls://api.example.com:8443"
+    )
+    args = container(resources).fetch("args")
+    assert_includes args, "--default-task-cpu=500m"
+    assert_includes args, "--default-task-memory=2Gi"
+    assert_includes args, "--worker-pool-name=dedicated"
+    assert_includes args, "--worker-pool-namespace=runtime"
+    assert_includes args, "--task-wakeup-timeout-seconds=1200"
+    assert_includes args, "--egress-allow-origins=https://github.com,tls://api.example.com:8443"
   end
 end

@@ -77,13 +77,23 @@ spec:
             - "--substrate-authority=api.ate-system.svc"
             - "--substrate-token-file=/var/run/secrets/ateapi/token"
             - "--substrate-ca-file=/run/servicedns-ca/trust-bundle.pem"
+            - "--default-task-cpu=1"
+            - "--default-task-memory=1Gi"
+            - "--task-wakeup-timeout-seconds=900"
+            - "--worker-pool-name=kagent-default"
+            - "--worker-pool-namespace=kagent"
+            # Add the HTTP(S) origins required by your Git repositories and model.
+            - "--egress-allow-origins=https://github.com,https://*.githubusercontent.com,https://generativelanguage.googleapis.com"
             - "--template=default-template"
             - "--template-atespace=ax-system"
           env:
+            - name: AX_DEFAULT_TASK_IMAGE
+              # Replace with the published amd64/arm64 image index digest before deployment.
+              value: "docker.io/benjaminhuo/ax-task-runner:latest"
             - name: ATENET_ROUTER_ADDR
               value: "atenet-router.ate-system.svc.cluster.local:80"
             - name: AX_SNAPSHOTS_BUCKET
-              value: "gs://dberkov-gke-dev3/ate-env/"
+              value: "s3://ate-snapshots/"
           ports:
             - containerPort: 8080
               name: http
@@ -95,8 +105,9 @@ spec:
               cpu: 1000m
               memory: 1Gi
           readinessProbe:
+            timeoutSeconds: 3
             httpGet:
-              path: /healthz
+              path: /readyz
               port: 8080
             initialDelaySeconds: 2
             periodSeconds: 5
