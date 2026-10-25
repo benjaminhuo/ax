@@ -874,7 +874,20 @@ func manifestFromArgs(args []string) (data []byte, ok bool, err error) {
 // The server renews its per-task Redis lock for as long as the RPC is in
 // flight, so this deadline is not constrained by the lock TTL (see
 // lock.RedisLocker).
-const lifecycleRPCTimeout = 5 * time.Minute
+const lifecycleRPCTimeout = 20 * time.Minute
+
+func lifecycleContext() (context.Context, context.CancelFunc, error) {
+	timeout := lifecycleRPCTimeout
+	if raw := os.Getenv("AX_LIFECYCLE_TIMEOUT"); raw != "" {
+		var err error
+		timeout, err = time.ParseDuration(raw)
+		if err != nil || timeout <= 0 {
+			return nil, nil, fmt.Errorf("AX_LIFECYCLE_TIMEOUT must be a positive duration")
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	return ctx, cancel, nil
+}
 
 func runSuspend(serverURL, atespace string, args []string) error {
 	name := ""
@@ -896,7 +909,10 @@ func runSuspend(serverURL, atespace string, args []string) error {
 	}
 	defer conn.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), lifecycleRPCTimeout)
+	ctx, cancel, err := lifecycleContext()
+	if err != nil {
+		return err
+	}
 	defer cancel()
 
 	if _, err := client.SuspendTask(ctx, &v1alpha1.SuspendTaskRequest{Atespace: atespace, Name: name}); err != nil {
@@ -927,7 +943,10 @@ func runResume(serverURL, atespace string, args []string) error {
 	}
 	defer conn.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), lifecycleRPCTimeout)
+	ctx, cancel, err := lifecycleContext()
+	if err != nil {
+		return err
+	}
 	defer cancel()
 
 	if _, err := client.ResumeTask(ctx, &v1alpha1.ResumeTaskRequest{Atespace: atespace, Name: name}); err != nil {
