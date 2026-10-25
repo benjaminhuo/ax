@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -35,7 +36,7 @@ const (
 	KindWorkspace = "Workspace"
 	KindModel     = "Model"
 
-	DefaultTaskImage       = "gcr.io/ax-substrate/ate-images/ax-task-runner"
+	DefaultTaskImage       = "docker.io/benjaminhuo/ax-task-runner:latest"
 	DefaultSystemNamespace = "ax-system"
 
 	// PhaseTerminating marks a task whose deletion has been requested and whose
@@ -311,13 +312,36 @@ func ValidateTask(t *Task) error {
 		return err
 	}
 	spec := t.GetSpec()
+	if image := spec.GetImage(); image != "" {
+		if err := ValidateTaskImage(image); err != nil {
+			return fmt.Errorf("spec.image: %w", err)
+		}
+	}
 	if ref := spec.GetWorkspace(); ref != nil {
 		if ref.GetName() == "" {
 			return errors.New("spec.workspace: name is required")
 		}
-		if p := ref.GetPath(); p != "" && !strings.HasPrefix(p, "/") {
-			return fmt.Errorf("spec.workspace: path %q must be absolute", p)
+		if err := ValidateWorkspacePath(ref.GetPath()); err != nil {
+			return fmt.Errorf("spec.workspace: %w", err)
 		}
 	}
 	return ValidateResources(spec.GetResources())
+}
+
+// ValidateWorkspacePath keeps the durable workspace mount disjoint from AX's
+// private state and projected egress trust. Substrate forbids nested mounts.
+func ValidateWorkspacePath(p string) error {
+	if p == "" {
+		return nil
+	}
+	if !path.IsAbs(p) {
+		return fmt.Errorf("path %q must be absolute", p)
+	}
+	p = path.Clean(p)
+	for _, reserved := range []string{"/ax", "/run/ax/egress"} {
+		if p == "/" || p == reserved || strings.HasPrefix(p, reserved+"/") || strings.HasPrefix(reserved, p+"/") {
+			return fmt.Errorf("path %q overlaps reserved mount %s", p, reserved)
+		}
+	}
+	return nil
 }

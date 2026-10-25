@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -47,6 +48,12 @@ func main() {
 		defaultTemplate         string
 		defaultTemplateAtespace string
 		defaultTaskImage        string
+		defaultTaskCPU          string
+		defaultTaskMemory       string
+		workerPoolName          string
+		workerPoolNamespace     string
+		wakeupTimeoutSeconds    int
+		egressOrigins           string
 	)
 
 	flag.StringVar(&listenAddr, "addr", ":8080", "HTTP listen address")
@@ -61,6 +68,12 @@ func main() {
 	flag.StringVar(&defaultTemplate, "template", "default-template", "Default Substrate ActorTemplate name")
 	flag.StringVar(&defaultTemplateAtespace, "template-atespace", v1alpha1.DefaultSystemNamespace, "Default Substrate ActorTemplate atespace")
 	flag.StringVar(&defaultTaskImage, "default-task-image", v1alpha1.DefaultTaskImage, "Container image for tasks that do not set spec.image (env: AX_DEFAULT_TASK_IMAGE)")
+	flag.StringVar(&defaultTaskCPU, "default-task-cpu", substrate.DefaultCPU, "CPU limit for tasks that omit it")
+	flag.StringVar(&defaultTaskMemory, "default-task-memory", substrate.DefaultMemory, "Memory limit for tasks that omit it")
+	flag.StringVar(&workerPoolName, "worker-pool-name", "kagent-default", "kagent WorkerPool name")
+	flag.StringVar(&workerPoolNamespace, "worker-pool-namespace", "kagent", "kagent WorkerPool namespace")
+	flag.IntVar(&wakeupTimeoutSeconds, "task-wakeup-timeout-seconds", substrate.DefaultWakeupTimeoutSeconds, "Seconds allowed for workspace bootstrap (1-3600)")
+	flag.StringVar(&egressOrigins, "egress-allow-origins", "", "Comma-separated HTTP(S) or tls:// origins allowed for task egress; empty denies all")
 	flag.Parse()
 
 	if envAddr := os.Getenv("ADDR"); envAddr != "" {
@@ -78,6 +91,20 @@ func main() {
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
+	if err := v1alpha1.ValidateTaskImage(defaultTaskImage); err != nil {
+		slog.Error("configure --default-task-image or AX_DEFAULT_TASK_IMAGE with a published multi-platform digest", "error", err)
+		os.Exit(1)
+	}
+	if wakeupTimeoutSeconds < 1 || wakeupTimeoutSeconds > 3600 {
+		slog.Error("task-wakeup-timeout-seconds must be between 1 and 3600")
+		os.Exit(1)
+	}
+	var origins []string
+	for _, origin := range strings.Split(egressOrigins, ",") {
+		if origin = strings.TrimSpace(origin); origin != "" {
+			origins = append(origins, origin)
+		}
+	}
 
 	slog.Info("starting ax-server",
 		"listenAddr", listenAddr,
@@ -104,9 +131,20 @@ func main() {
 		CAFile:      substrateCAFile,
 		InsecureTLS: substrateInsecureTLS,
 		Plaintext:   substratePlaintext,
+		Template: substrate.TemplateOptions{
+			DefaultCPU:    defaultTaskCPU,
+			DefaultMemory: defaultTaskMemory,
+			WorkerSelector: map[string]string{
+				"kagent.dev/worker-pool-name":      workerPoolName,
+				"kagent.dev/worker-pool-namespace": workerPoolNamespace,
+			},
+			WakeupTimeoutSeconds: int32(wakeupTimeoutSeconds),
+		},
+		EgressOrigins: origins,
 	})
 	if err != nil {
-		slog.Warn("could not initialize substrate client; running without substrate reconciliation", "error", err)
+		slog.Error("could not initialize substrate client", "error", err)
+		os.Exit(1)
 	} else {
 		defer subClient.Close()
 		reconciler = controller.NewTaskReconciler(subClient, defaultTemplate, defaultTemplateAtespace, defaultTaskImage)
@@ -115,6 +153,12 @@ func main() {
 	srv := server.NewServer(rStore, server.Options{
 		Locker:     rLocker,
 		Reconciler: reconciler,
+		Readiness: func(ctx context.Context) error {
+			if err := rClient.Ping(ctx).Err(); err != nil {
+				return err
+			}
+			return subClient.Ready(ctx)
+		},
 	})
 
 	httpServer := &http.Server{

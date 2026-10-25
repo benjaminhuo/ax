@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/google/ax/internal/lock"
 	"github.com/google/ax/internal/store"
@@ -42,6 +43,7 @@ type Reconciler interface {
 type Options struct {
 	Locker     lock.Locker
 	Reconciler Reconciler
+	Readiness  func(context.Context) error
 }
 
 // Server provides the gRPC API for AX.
@@ -51,6 +53,7 @@ type Server struct {
 	locker     lock.Locker
 	reconciler Reconciler
 	grpcServer *grpc.Server
+	readiness  func(context.Context) error
 }
 
 // NewServer creates a new AX API server.
@@ -69,6 +72,7 @@ func NewServer(s store.Store, opts ...Options) *Server {
 		locker:     locker,
 		reconciler: opt.Reconciler,
 		grpcServer: grpc.NewServer(),
+		readiness:  opt.Readiness,
 	}
 	v1alpha1.RegisterAXServer(srv.grpcServer, srv)
 	return srv
@@ -87,6 +91,19 @@ func (s *Server) Handler() http.Handler {
 			return
 		}
 		if r.URL.Path == "/healthz" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok\n"))
+			return
+		}
+		if r.URL.Path == "/readyz" {
+			ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+			defer cancel()
+			if s.readiness != nil {
+				if err := s.readiness(ctx); err != nil {
+					http.Error(w, "dependencies unavailable", http.StatusServiceUnavailable)
+					return
+				}
+			}
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("ok\n"))
 			return

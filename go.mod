@@ -4,17 +4,21 @@ go 1.27.1
 
 require (
 	github.com/agent-substrate/env v0.0.11-0.20260912052224-4468a200b170
-	github.com/agent-substrate/substrate v0.5.0
 	github.com/cenkalti/backoff/v5 v5.0.3
+	github.com/distribution/reference v0.6.0
 	github.com/redis/go-redis/v9 v9.22.0
+	go.ate.dev/substrate v0.6.0-alpha3
 	google.golang.org/grpc v1.83.2
 	google.golang.org/protobuf v1.36.12
 	gopkg.in/yaml.v3 v3.0.1
 )
 
+replace go.ate.dev/substrate => github.com/kagent-dev/substrate v0.6.0-alpha3
+
 require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
+	github.com/opencontainers/go-digest v1.0.0 // indirect
 	github.com/rogpeppe/go-internal v1.14.1 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
 	golang.org/x/net v0.60.0 // indirect

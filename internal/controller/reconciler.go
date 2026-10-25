@@ -24,13 +24,13 @@ import (
 	"net/http"
 	"os"
 	"regexp"
-	"sort"
 	"strings"
 	"time"
 
 	"github.com/google/ax/internal/model"
 	"github.com/google/ax/internal/substrate"
 	"github.com/google/ax/pkg/apis/v1alpha1"
+	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -189,16 +189,17 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, ws 
 		task.Status.Phase = "Failed"
 		return task, fmt.Errorf("validating resources: %w", err)
 	}
-	resources := substrate.ResourceLimits(task.Spec.Resources)
 
 	// If a custom image, workspace, or extra environment is specified, provision or use a dedicated ActorTemplate
 	if task.Spec != nil && (task.Spec.Image != "" || len(extraEnv) > 0) {
 		slog.Info("ensuring custom ActorTemplate for task", "image", task.Spec.Image)
-		customTemplateName := taskTemplateName(task.Metadata.Name, task.Spec.Image, extraEnv)
-
-		// spec.resources rides along in AX_TASK_YAML, so a limits change is already
-		// part of the template digest and re-provisions the template.
-		tmpl, err := r.client.EnsureActorTemplateWithImage(ctx, templateAtespace, templateName, atespace, customTemplateName, task.Spec.Image, resources, extraEnv)
+		tmpl, err := r.client.PrepareActorTemplate(atespace, task.Spec.Image, extraEnv, task.Spec.Resources, task.Spec.GetWorkspace().GetPath())
+		if err == nil {
+			tmpl.Metadata.Name, err = taskTemplateName(task.Metadata.Name, tmpl)
+		}
+		if err == nil {
+			tmpl, err = r.client.EnsureActorTemplate(ctx, tmpl)
+		}
 		if err != nil {
 			if substrate.IsTransientError(err) {
 				r.setNotReady(task, "SubstrateUnavailable", err.Error(), now)
@@ -231,12 +232,12 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, ws 
 		task.Status.Phase = "Failed"
 		return task, fmt.Errorf("ensuring actor: %w", err)
 	}
-
 	// 4. Suspend or Resume the Actor
 	// Tasks are suspended by default upon creation until explicitly resumed to "Running".
 	if task.Status.Phase == "Suspended" || task.Status.Phase == "" {
 		slog.Info("suspending actor on Substrate", "actor", actorName)
 		if err := r.client.SuspendActor(ctx, atespace, actorName); err != nil {
+			r.setNotReady(task, "ActorSuspendFailed", err.Error(), now)
 			return task, fmt.Errorf("suspending actor: %w", err)
 		}
 		task.Status.WorkerIp = ""
@@ -244,6 +245,17 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, ws 
 		r.setCondition(task, condReady, "False", "TaskSuspended", "Task is suspended", now)
 		slog.Info("task successfully suspended", "name", task.Metadata.Name, "actor", actorName)
 		return task, nil
+	}
+	// Policy failures must prevent execution, but must never prevent stopping
+	// an Actor whose egress policy cannot currently be read or updated.
+	if err := r.client.EnsureActorEgressPolicy(ctx, atespace, actorName); err != nil {
+		r.setNotReady(task, "EgressPolicyFailed", substrateErrorMessage(err), now)
+		if substrate.IsTransientError(err) {
+			task.Status.Phase = "Pending"
+		} else {
+			task.Status.Phase = "Failed"
+		}
+		return task, fmt.Errorf("ensuring actor egress policy: %w", err)
 	}
 
 	// Resume the Actor to activate container execution
@@ -432,25 +444,33 @@ func (r *TaskReconciler) lookupGeminiKey(ctx context.Context, atespace string) s
 }
 
 // taskTemplateName derives the per-task ActorTemplate name from the task name and a
-// digest of the image and container environment, so a spec change yields a new template.
-func taskTemplateName(taskName, image string, env map[string]string) string {
-	h := sha256.New()
-	h.Write([]byte(image))
-	keys := make([]string, 0, len(env))
-	for k := range env {
-		keys = append(keys, k)
+// digest of every effective template field, including operator defaults.
+func taskTemplateName(taskName string, tmpl *ateapipb.ActorTemplate) (string, error) {
+	spec := substrate.ActorTemplateSpec(tmpl)
+	spec.Metadata.Name = ""
+	data, err := (proto.MarshalOptions{Deterministic: true}).Marshal(spec)
+	if err != nil {
+		return "", fmt.Errorf("hashing actor template: %w", err)
 	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		h.Write([]byte(k + "=" + env[k] + ";"))
+	digest := sha256.Sum256(data)
+	return fmt.Sprintf("%s-tmpl-%x", taskTemplatePrefix(taskName), digest[:templateDigestBytes]), nil
+}
+
+func taskTemplatePrefix(taskName string) string {
+	const maxPrefixLength = v1alpha1.MaxNameLength - len("-tmpl-") - 2*templateDigestBytes
+	if len(taskName) > maxPrefixLength {
+		// Include the untruncated task name in the prefix digest to keep cleanup
+		// isolated even when different task names share a long prefix.
+		digest := sha256.Sum256([]byte(taskName))
+		return fmt.Sprintf("%s-%x", strings.TrimRight(taskName[:maxPrefixLength-9], "-"), digest[:4])
 	}
-	return fmt.Sprintf("%s-tmpl-%x", taskName, h.Sum(nil)[:templateDigestBytes])
+	return taskName
 }
 
 // taskTemplatePattern matches every ActorTemplate name taskTemplateName can produce
 // for the given task, across all spec revisions.
 func taskTemplatePattern(taskName string) *regexp.Regexp {
-	return regexp.MustCompile(fmt.Sprintf("^%s-tmpl-[0-9a-f]{%d}$", regexp.QuoteMeta(taskName), 2*templateDigestBytes))
+	return regexp.MustCompile(fmt.Sprintf("^%s-tmpl-[0-9a-f]{%d}$", regexp.QuoteMeta(taskTemplatePrefix(taskName)), 2*templateDigestBytes))
 }
 
 // ReconcileDelete cleans up Substrate resources when a Task is deleted: the actor,

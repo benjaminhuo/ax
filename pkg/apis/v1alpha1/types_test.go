@@ -38,7 +38,7 @@ func fullTask() *v1alpha1.Task {
 			CreateTime: timestamppb.New(time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)),
 		},
 		Spec: &v1alpha1.TaskSpec{
-			Image:   "example.com/img:1",
+			Image:   "example.com/img:1@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 			Command: []string{"sh", "-c", "true"},
 			Env:     []*v1alpha1.EnvVar{{Name: "A", Value: "1"}},
 			Resources: &v1alpha1.ResourcesSpec{

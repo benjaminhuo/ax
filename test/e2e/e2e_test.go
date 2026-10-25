@@ -23,8 +23,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
+	"github.com/google/ax/internal/substrate"
 	"github.com/google/ax/pkg/apis/v1alpha1"
+	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -243,10 +244,14 @@ func TestE2E_TaskLifecycleAndSubstrateSync(t *testing.T) {
 	if probe := tmpl.GetContainers()[0].GetWakeupProbe().GetHttpGet(); probe.GetPath() != "/readyz" || probe.GetPort() != 80 {
 		t.Fatalf("unexpected WakeupProbe: %+v", tmpl.GetContainers()[0].GetWakeupProbe())
 	}
-	// Newer Substrate versions may return SnapshotConfig fields AX's proto does
-	// not know about, so accept either a known storage location or unknown fields.
-	if sc := tmpl.GetSnapshotConfig(); sc.GetStorageLocation() == "" && len(sc.ProtoReflect().GetUnknown()) == 0 {
+	if sc := tmpl.GetSnapshotConfig(); !strings.HasPrefix(sc.GetStorageLocation(), "s3://") || sc.GetGoldenSnapshotConfig().GetMode() != ateapipb.GoldenSnapshotMode_GOLDEN_SNAPSHOT_MODE_DISABLED {
 		t.Fatalf("unexpected SnapshotConfig: %+v", sc)
+	}
+	if tmpl.GetWorkerSelector().GetMatchLabels()["kagent.dev/worker-pool-name"] != "ax-workers" {
+		t.Fatal("task was not restricted to the E2E WorkerPool")
+	}
+	if len(tmpl.GetResources().GetLimits()) != 2 {
+		t.Fatal("both CPU and memory limits must be set")
 	}
 
 	// 4. Resuming moves the task to Running on a worker reported by Substrate.
@@ -475,7 +480,7 @@ func TestE2E_TaskSuspendAndResumePersistence(t *testing.T) {
 	env.mustRunAX(t, ns, "resume", "task", task)
 
 	// 1. Write to the durable /workspace volume and to the ephemeral rootfs.
-	env.ssh(t, ns, task, "echo durable-data-42 > /workspace/durable.txt && echo ephemeral-tmp > /tmp/ephemeral.txt")
+	env.ssh(t, ns, task, "echo durable-data-42 > /workspace/durable.txt && echo private-state-42 > /ax/persistence-check && echo ephemeral-tmp > /tmp/ephemeral.txt")
 
 	// 2. Suspend: the task and its Actor are suspended and the worker released.
 	assertContains(t, "'ax suspend task'", env.mustRunAX(t, ns, "suspend", "task", task), "suspended")
@@ -486,15 +491,16 @@ func TestE2E_TaskSuspendAndResumePersistence(t *testing.T) {
 		t.Fatalf("expected empty WorkerIp when suspended, got %q", ip)
 	}
 	actor := env.getActor(t, ns, task, ateapipb.ActorState_ACTOR_STATE_SUSPENDED)
-	if len(actor.GetStatus().GetSnapshots()) == 0 && len(actor.GetStatus().ProtoReflect().GetUnknown()) == 0 {
-		t.Fatal("expected non-empty Snapshots on suspended actor")
+	snapshot := substrate.LatestActorSnapshot(actor)
+	if snapshot == nil || snapshot.GetDurableSnapshot().GetStatus() != ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED || !strings.HasPrefix(snapshot.GetDurableSnapshot().GetObject().GetSnapshotUri(), "s3://") {
+		t.Fatal("latest snapshot must be completed in S3/RustFS before suspend succeeds")
 	}
 
 	// 3. Resume: VOLUMES-fidelity snapshots restore /workspace but cold-boot the rootfs.
 	env.mustRunAX(t, ns, "resume", "task", task)
 	out := env.ssh(t, ns, task,
-		"echo DURABLE=$(cat /workspace/durable.txt); if [ -f /tmp/ephemeral.txt ]; then echo TMP_EXISTS; else echo TMP_GONE; fi")
-	assertContains(t, "post-resume check", out, "DURABLE=durable-data-42", "TMP_GONE")
+		"echo DURABLE=$(cat /workspace/durable.txt); echo PRIVATE=$(cat /ax/persistence-check); if [ -f /tmp/ephemeral.txt ]; then echo TMP_EXISTS; else echo TMP_GONE; fi")
+	assertContains(t, "post-resume check", out, "DURABLE=durable-data-42", "PRIVATE=private-state-42", "TMP_GONE")
 }
 
 // TestE2E_WatchDescribeAndAtespaceIsolation verifies that a task in a custom

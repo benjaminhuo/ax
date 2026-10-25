@@ -62,7 +62,7 @@ metadata:
   name: my-task
   atespace: default
 spec:
-  image: ubuntu:latest
+  image: ubuntu:latest@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
   command: ["echo", "hello"]
 `
 	var node yaml.Node
@@ -99,7 +99,7 @@ metadata:
   name: existing-task
   atespace: default
 spec:
-  image: ubuntu:latest
+  image: ubuntu:latest@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
   command: ["echo", "hello"]
 `
 	var node yaml.Node

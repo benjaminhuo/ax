@@ -21,9 +21,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
-	"github.com/agent-substrate/substrate/pkg/sandboxclass"
 	"github.com/google/ax/pkg/apis/v1alpha1"
+	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -203,7 +202,7 @@ func TestClient_DeleteActor_PropagatesRPCError(t *testing.T) {
 }
 
 func TestBuildActorTemplate(t *testing.T) {
-	t.Setenv("AX_SNAPSHOTS_BUCKET", "gs://ate-snapshots/ax/")
+	t.Setenv("AX_SNAPSHOTS_BUCKET", "s3://ate-snapshots/ax/")
 
 	tmpl := BuildActorTemplate("", "test-tmpl", "", map[string]string{"FOO": "BAR"}, nil, "", nil)
 	if tmpl.GetMetadata().GetAtespace() != "default" {
@@ -224,14 +223,20 @@ func TestBuildActorTemplate(t *testing.T) {
 	if snapCfg == nil {
 		t.Fatal("expected SnapshotConfig to be set")
 	}
-	if snapCfg.GetStorageLocation() != "gs://ate-snapshots/ax/" {
-		t.Errorf("expected StorageLocation gs://ate-snapshots/ax/, got %q", snapCfg.GetStorageLocation())
+	if snapCfg.GetStorageLocation() != "s3://ate-snapshots/ax/" {
+		t.Errorf("expected StorageLocation s3://ate-snapshots/ax/, got %q", snapCfg.GetStorageLocation())
 	}
 	if snapCfg.GetPreferredFidelity() != ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES {
 		t.Errorf("expected PreferredFidelity VOLUMES, got %v", snapCfg.GetPreferredFidelity())
 	}
-	if got := tmpl.GetSandboxConfig().GetSandboxClass(); got != sandboxclass.GVisor {
-		t.Errorf("expected SandboxClass %q, got %q", sandboxclass.GVisor, got)
+	if got := tmpl.GetWorkerSelector().GetMatchLabels()["kagent.dev/worker-pool-name"]; got != "kagent-default" {
+		t.Errorf("expected kagent-default pool, got %q", got)
+	}
+	if snapCfg.GetGoldenSnapshotConfig().GetMode() != ateapipb.GoldenSnapshotMode_GOLDEN_SNAPSHOT_MODE_DISABLED {
+		t.Fatal("task templates must not execute a golden Actor")
+	}
+	if container.GetWakeupProbe().GetTimeoutSeconds() != DefaultWakeupTimeoutSeconds {
+		t.Fatal("wakeup timeout must allow workspace bootstrap")
 	}
 }
 
@@ -316,7 +321,7 @@ func TestClient_EnsureActorTemplateWithImage_Success(t *testing.T) {
 		"default-template",
 		"default",
 		"task-1-tmpl-abcd",
-		"custom-image:v1",
+		"custom-image:v1@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		nil,
 		map[string]string{"FOO": "BAR"},
 	)
@@ -326,7 +331,7 @@ func TestClient_EnsureActorTemplateWithImage_Success(t *testing.T) {
 	if created.GetMetadata().GetAtespace() != "default" || created.GetMetadata().GetName() != "task-1-tmpl-abcd" {
 		t.Errorf("unexpected metadata: %+v", created.GetMetadata())
 	}
-	if len(created.GetContainers()) != 1 || created.GetContainers()[0].GetImage() != "custom-image:v1" {
+	if len(created.GetContainers()) != 1 || created.GetContainers()[0].GetImage() != "custom-image:v1@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
 		t.Errorf("expected container image custom-image:v1, got %+v", created.GetContainers())
 	}
 
@@ -351,7 +356,7 @@ func TestClient_EnsureActorTemplateWithImage_PropagatesError(t *testing.T) {
 		"default-template",
 		"default",
 		"task-1-tmpl-abcd",
-		"custom-image:v1",
+		"custom-image:v1@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		nil,
 	)
 	if err == nil {
@@ -455,59 +460,34 @@ func TestIsTransientError(t *testing.T) {
 }
 
 func TestResourceLimits(t *testing.T) {
-	tests := []struct {
-		name string
-		reqs *v1alpha1.ResourcesSpec
-		want *ateapipb.Resources
-	}{
-		{name: "nil"},
-		{name: "empty", reqs: &v1alpha1.ResourcesSpec{}},
-		{name: "empty limits", reqs: &v1alpha1.ResourcesSpec{Limits: &v1alpha1.ResourceList{}}},
-		{
-			name: "cpu limit",
-			reqs: &v1alpha1.ResourcesSpec{Limits: &v1alpha1.ResourceList{Cpu: "2"}},
-			want: &ateapipb.Resources{Limits: []*ateapipb.Limits{{Name: "cpu", Quantity: "2"}}},
-		},
-		{
-			name: "memory limit",
-			reqs: &v1alpha1.ResourcesSpec{Limits: &v1alpha1.ResourceList{Memory: "4Gi"}},
-			want: &ateapipb.Resources{Limits: []*ateapipb.Limits{{Name: "memory", Quantity: "4Gi"}}},
-		},
-		{
-			name: "cpu and memory limits",
-			reqs: &v1alpha1.ResourcesSpec{
-				Limits: &v1alpha1.ResourceList{Cpu: "2", Memory: "4Gi"},
-			},
-			want: &ateapipb.Resources{Limits: []*ateapipb.Limits{
-				{Name: "cpu", Quantity: "2"},
-				{Name: "memory", Quantity: "4Gi"},
-			}},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := ResourceLimits(tt.reqs)
-			if !proto.Equal(got, tt.want) {
-				t.Fatalf("ResourceLimits() = %v, want %v", got, tt.want)
+	for _, tc := range []struct{ name, cpu, memory, wantCPU, wantMemory string }{
+		{"defaults", "", "", "1", "1Gi"},
+		{"CPU override", "2", "", "2", "1Gi"},
+		{"memory override", "", "4Gi", "1", "4Gi"},
+		{"both overrides", "2", "4Gi", "2", "4Gi"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ResourceLimits(&v1alpha1.ResourcesSpec{Limits: &v1alpha1.ResourceList{Cpu: tc.cpu, Memory: tc.memory}})
+			want := &ateapipb.Resources{Limits: []*ateapipb.Limits{{Name: "cpu", Quantity: tc.wantCPU}, {Name: "memory", Quantity: tc.wantMemory}}}
+			if !proto.Equal(got, want) {
+				t.Fatalf("resources = %v, want %v", got, want)
 			}
 		})
+	}
+	got := ResourceLimits(nil, TemplateOptions{DefaultCPU: "500m", DefaultMemory: "2Gi"})
+	if got.GetLimits()[0].GetQuantity() != "500m" || got.GetLimits()[1].GetQuantity() != "2Gi" {
+		t.Fatalf("operator defaults lost: %v", got)
 	}
 }
 
 func TestBuildActorTemplate_Resources(t *testing.T) {
-	limits := &ateapipb.Resources{Limits: []*ateapipb.Limits{
-		{Name: "cpu", Quantity: "2"},
-		{Name: "memory", Quantity: "4Gi"},
-	}}
-	tmpl := BuildActorTemplate("default", "task-tmpl-01234567", "ghcr.io/my-org/agent@sha256:abc", nil, nil, "", limits)
+	limits := ResourceLimits(&v1alpha1.ResourcesSpec{Limits: &v1alpha1.ResourceList{Cpu: "2", Memory: "4Gi"}})
+	tmpl := BuildActorTemplate("default", "task-tmpl-01234567", "", nil, nil, "", limits)
 	if !proto.Equal(tmpl.GetResources(), limits) {
 		t.Fatalf("template resources = %v, want %v", tmpl.GetResources(), limits)
 	}
-
-	// Without limits the template must not carry a resources block, so the
-	// worker defaults keep applying.
-	tmpl = BuildActorTemplate("default", "task-tmpl-01234567", "ghcr.io/my-org/agent@sha256:abc", nil, nil, "", nil)
-	if tmpl.GetResources() != nil {
-		t.Fatalf("template without limits has resources %v, want none", tmpl.GetResources())
+	tmpl = BuildActorTemplate("default", "task-tmpl-01234567", "", nil, nil, "", nil)
+	if !proto.Equal(tmpl.GetResources(), ResourceLimits(nil)) {
+		t.Fatal("template must carry both default limits")
 	}
 }

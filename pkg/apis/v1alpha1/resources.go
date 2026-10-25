@@ -36,12 +36,17 @@ const MaxCPULimitCores = 1000
 
 // ValidateResources reports the first problem with a task's resource
 // requirements. A nil or empty value is valid: the sandbox is then sized by its
-// worker's defaults.
+// server's configured defaults. Substrate requires both effective limits.
 func ValidateResources(reqs *ResourcesSpec) error {
 	if req := reqs.GetRequests(); req.GetCpu() != "" || req.GetMemory() != "" {
 		return errors.New("spec.resources.requests: not supported, only spec.resources.limits is applied to the sandbox")
 	}
 	limits := reqs.GetLimits()
+	for name, quantity := range map[string]string{"cpu": limits.GetCpu(), "memory": limits.GetMemory()} {
+		if len(quantity) > 32 {
+			return fmt.Errorf("spec.resources.limits.%s: quantity exceeds 32 characters", name)
+		}
+	}
 	if cpu := limits.GetCpu(); cpu != "" {
 		q, err := parseQuantity(cpu)
 		if err != nil {

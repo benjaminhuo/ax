@@ -58,6 +58,32 @@ func TestServerHealthzHTTP(t *testing.T) {
 	}
 }
 
+func TestReadinessReflectsDependenciesWithoutFailingLiveness(t *testing.T) {
+	available := false
+	srv := server.NewServer(memory.NewStore(), server.Options{Readiness: func(context.Context) error {
+		if !available {
+			return errors.New("unavailable")
+		}
+		return nil
+	}})
+	for _, tc := range []struct {
+		path  string
+		ready bool
+		want  int
+	}{
+		{"/readyz", false, http.StatusServiceUnavailable},
+		{"/healthz", false, http.StatusOK},
+		{"/readyz", true, http.StatusOK},
+	} {
+		available = tc.ready
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tc.path, nil))
+		if rec.Code != tc.want {
+			t.Errorf("%s ready=%v: status=%d", tc.path, tc.ready, rec.Code)
+		}
+	}
+}
+
 func TestServerGRPC(t *testing.T) {
 	memStore := memory.NewStore()
 	srv := server.NewServer(memStore)
@@ -106,7 +132,7 @@ func TestServerGRPC(t *testing.T) {
 	}
 	if _, err := client.CreateTask(ctx, &v1alpha1.CreateTaskRequest{Task: &v1alpha1.Task{
 		Metadata: &v1alpha1.ObjectMeta{Name: "grpc-task"},
-		Spec:     &v1alpha1.TaskSpec{Image: "alpine"},
+		Spec:     &v1alpha1.TaskSpec{Image: "alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
 	}}); err != nil {
 		t.Fatalf("CreateTask failed: %v", err)
 	}
@@ -144,7 +170,7 @@ func TestServerGRPC(t *testing.T) {
 	}
 
 	// Test that Task is immutable
-	task.Spec.Image = "ghcr.io/test/updated-image"
+	task.Spec.Image = "ghcr.io/test/updated-image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	_, err = client.CreateTask(ctx, &v1alpha1.CreateTaskRequest{Task: task})
 	if err == nil {
 		t.Fatalf("expected CreateTask to fail on existing task because tasks are immutable")
@@ -357,7 +383,7 @@ func TestServer_DirectReconcilerLifecycle(t *testing.T) {
 	task, err := srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{
 		Task: &v1alpha1.Task{
 			Metadata: &v1alpha1.ObjectMeta{Name: "task-rec"},
-			Spec:     &v1alpha1.TaskSpec{Image: "alpine"},
+			Spec:     &v1alpha1.TaskSpec{Image: "alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
 		},
 	})
 	if err != nil {
@@ -428,7 +454,7 @@ func TestServer_DeleteTask_BlocksAndSetsPhaseTerminating(t *testing.T) {
 	_, err := srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{
 		Task: &v1alpha1.Task{
 			Metadata: &v1alpha1.ObjectMeta{Name: "task-term"},
-			Spec:     &v1alpha1.TaskSpec{Image: "alpine"},
+			Spec:     &v1alpha1.TaskSpec{Image: "alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
 		},
 	})
 	if err != nil {
@@ -461,7 +487,7 @@ func TestServer_DeleteTask_ReconcileErrorRetainsTask(t *testing.T) {
 	_, err := srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{
 		Task: &v1alpha1.Task{
 			Metadata: &v1alpha1.ObjectMeta{Name: "task-err"},
-			Spec:     &v1alpha1.TaskSpec{Image: "alpine"},
+			Spec:     &v1alpha1.TaskSpec{Image: "alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
 		},
 	})
 	if err != nil {
@@ -504,7 +530,7 @@ func TestServer_DeleteTask_UpdateStatusError(t *testing.T) {
 	_, err := srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{
 		Task: &v1alpha1.Task{
 			Metadata: &v1alpha1.ObjectMeta{Name: "task-status-fail"},
-			Spec:     &v1alpha1.TaskSpec{Image: "alpine"},
+			Spec:     &v1alpha1.TaskSpec{Image: "alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
 		},
 	})
 	if err != nil {
@@ -531,7 +557,7 @@ func TestServer_SuspendTask_ReconcileErrorRetainsRunningState(t *testing.T) {
 
 	if err := st.SaveTask(ctx, &v1alpha1.Task{
 		Metadata: &v1alpha1.ObjectMeta{Name: "task-suspend-err", Atespace: "default"},
-		Spec:     &v1alpha1.TaskSpec{Image: "alpine"},
+		Spec:     &v1alpha1.TaskSpec{Image: "alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
 		Status: &v1alpha1.TaskStatus{
 			Phase:      "Running",
 			Actor:      "task-suspend-err",
@@ -570,7 +596,7 @@ func TestServer_SuspendTask_SuccessUpdatesStoredState(t *testing.T) {
 
 	if err := st.SaveTask(ctx, &v1alpha1.Task{
 		Metadata: &v1alpha1.ObjectMeta{Name: "task-suspend-ok", Atespace: "default"},
-		Spec:     &v1alpha1.TaskSpec{Image: "alpine"},
+		Spec:     &v1alpha1.TaskSpec{Image: "alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
 		Status: &v1alpha1.TaskStatus{
 			Phase:      "Running",
 			Actor:      "task-suspend-ok",
@@ -610,7 +636,7 @@ func TestServer_CreateTask_InitialPhaseSuspended(t *testing.T) {
 	task, err := srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{
 		Task: &v1alpha1.Task{
 			Metadata: &v1alpha1.ObjectMeta{Name: "task-create-suspended"},
-			Spec:     &v1alpha1.TaskSpec{Image: "alpine"},
+			Spec:     &v1alpha1.TaskSpec{Image: "alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
 		},
 	})
 	if err != nil {
@@ -640,7 +666,7 @@ func TestServer_CreateTask_ReconcileErrorMarksFailed(t *testing.T) {
 	_, err := srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{
 		Task: &v1alpha1.Task{
 			Metadata: &v1alpha1.ObjectMeta{Name: "task-create-fail"},
-			Spec:     &v1alpha1.TaskSpec{Image: "alpine"},
+			Spec:     &v1alpha1.TaskSpec{Image: "alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
 		},
 	})
 	if status.Code(err) != codes.Internal {
@@ -660,7 +686,7 @@ func TestServer_CreateTask_ReconcileErrorMarksFailed(t *testing.T) {
 	_, err = srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{
 		Task: &v1alpha1.Task{
 			Metadata: &v1alpha1.ObjectMeta{Name: "task-create-fail"},
-			Spec:     &v1alpha1.TaskSpec{Image: "alpine"},
+			Spec:     &v1alpha1.TaskSpec{Image: "alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
 		},
 	})
 	if status.Code(err) != codes.FailedPrecondition {
@@ -685,7 +711,7 @@ func TestServer_TransientSubstrateUnavailableRecovery(t *testing.T) {
 	_, err := srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{
 		Task: &v1alpha1.Task{
 			Metadata: &v1alpha1.ObjectMeta{Name: "simple-task"},
-			Spec:     &v1alpha1.TaskSpec{Image: "alpine"},
+			Spec:     &v1alpha1.TaskSpec{Image: "alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
 		},
 	})
 	if status.Code(err) != codes.Unavailable {
@@ -704,7 +730,7 @@ func TestServer_TransientSubstrateUnavailableRecovery(t *testing.T) {
 	_, err = srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{
 		Task: &v1alpha1.Task{
 			Metadata: &v1alpha1.ObjectMeta{Name: "simple-task"},
-			Spec:     &v1alpha1.TaskSpec{Image: "debian"},
+			Spec:     &v1alpha1.TaskSpec{Image: "debian@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
 		},
 	})
 	if status.Code(err) != codes.FailedPrecondition {
@@ -717,7 +743,7 @@ func TestServer_TransientSubstrateUnavailableRecovery(t *testing.T) {
 	_, err = srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{
 		Task: &v1alpha1.Task{
 			Metadata: &v1alpha1.ObjectMeta{Name: "simple-task"},
-			Spec:     &v1alpha1.TaskSpec{Image: "alpine"},
+			Spec:     &v1alpha1.TaskSpec{Image: "alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
 		},
 	})
 	if status.Code(err) != codes.Unavailable {
@@ -732,7 +758,7 @@ func TestServer_TransientSubstrateUnavailableRecovery(t *testing.T) {
 	_, err = srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{
 		Task: &v1alpha1.Task{
 			Metadata: &v1alpha1.ObjectMeta{Name: "simple-task"},
-			Spec:     &v1alpha1.TaskSpec{Image: "alpine"},
+			Spec:     &v1alpha1.TaskSpec{Image: "alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
 			Status: &v1alpha1.TaskStatus{
 				Phase: "Running",
 				Conditions: []*v1alpha1.Condition{
@@ -755,7 +781,7 @@ func TestServer_TransientSubstrateUnavailableRecovery(t *testing.T) {
 	created, err := srv.CreateTask(ctx, &v1alpha1.CreateTaskRequest{
 		Task: &v1alpha1.Task{
 			Metadata: &v1alpha1.ObjectMeta{Name: "simple-task"},
-			Spec:     &v1alpha1.TaskSpec{Image: "alpine"},
+			Spec:     &v1alpha1.TaskSpec{Image: "alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
 		},
 	})
 	if err != nil {

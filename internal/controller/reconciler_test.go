@@ -23,16 +23,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"github.com/google/ax/internal/controller"
 	"github.com/google/ax/internal/substrate"
 	"github.com/google/ax/pkg/apis/v1alpha1"
+	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
+
+const testDefaultImage = "docker.io/benjaminhuo/ax-task-runner:latest@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 type mockControlServer struct {
 	ateapipb.UnimplementedControlServer
@@ -56,6 +58,8 @@ type mockControlServer struct {
 	// createTemplateErr, when set, is returned by CreateActorTemplate to stand in
 	// for Substrate rejecting a template (for example an invalid quantity).
 	createTemplateErr error
+	egressPolicies    map[string]*ateapipb.EgressPolicy
+	egressErr         error
 }
 
 // noSecrets is a SecretResolver for tests: it never finds a key and never touches a cluster.
@@ -68,7 +72,48 @@ func (m *mockControlServer) GetActorTemplate(_ context.Context, req *ateapipb.Ge
 	if !m.actorTemplates[ref.GetName()] {
 		return nil, status.Error(codes.NotFound, "template not found")
 	}
+	for _, tmpl := range m.createdTemplates {
+		if tmpl.GetMetadata().GetName() == ref.GetName() {
+			return proto.Clone(tmpl).(*ateapipb.ActorTemplate), nil
+		}
+	}
 	return &ateapipb.ActorTemplate{Metadata: &ateapipb.ResourceMetadata{Name: ref.GetName(), Atespace: ref.GetAtespace()}}, nil
+}
+
+func (m *mockControlServer) GetAtespace(_ context.Context, req *ateapipb.GetAtespaceRequest) (*ateapipb.Atespace, error) {
+	for _, name := range m.createdAtespaces {
+		if name == req.GetAtespace().GetName() {
+			return &ateapipb.Atespace{Metadata: &ateapipb.ResourceMetadata{Name: name}}, nil
+		}
+	}
+	return nil, status.Error(codes.NotFound, "atespace not found")
+}
+
+func (m *mockControlServer) GetActorEgressPolicy(_ context.Context, req *ateapipb.GetActorEgressPolicyRequest) (*ateapipb.EgressPolicy, error) {
+	if m.egressErr != nil {
+		return nil, m.egressErr
+	}
+	policy := m.egressPolicies[req.GetActor().GetName()]
+	if policy == nil {
+		return nil, status.Error(codes.NotFound, "policy not found")
+	}
+	return proto.Clone(policy).(*ateapipb.EgressPolicy), nil
+}
+
+func (m *mockControlServer) CreateActorEgressPolicy(_ context.Context, req *ateapipb.CreateActorEgressPolicyRequest) (*ateapipb.EgressPolicy, error) {
+	if m.egressPolicies == nil {
+		m.egressPolicies = make(map[string]*ateapipb.EgressPolicy)
+	}
+	policy := proto.Clone(req.GetEgressPolicy()).(*ateapipb.EgressPolicy)
+	policy.Metadata.Uid = "00000000-0000-0000-0000-000000000001"
+	policy.Metadata.Version = 1
+	m.egressPolicies[req.GetActor().GetName()] = policy
+	return policy, nil
+}
+
+func (m *mockControlServer) UpdateActorEgressPolicy(_ context.Context, req *ateapipb.UpdateActorEgressPolicyRequest) (*ateapipb.EgressPolicy, error) {
+	m.egressPolicies[req.GetActor().GetName()] = proto.Clone(req.GetEgressPolicy()).(*ateapipb.EgressPolicy)
+	return req.GetEgressPolicy(), nil
 }
 
 func (m *mockControlServer) CreateActorTemplate(_ context.Context, req *ateapipb.CreateActorTemplateRequest) (*ateapipb.ActorTemplate, error) {
@@ -128,7 +173,10 @@ func (m *mockControlServer) ResumeActor(ctx context.Context, req *ateapipb.Resum
 		name = req.Actor.Name
 	}
 	m.resumedActors = append(m.resumedActors, name)
-	wIP := "10.244.1.42"
+	if m.egressPolicies[name] == nil {
+		return nil, status.Error(codes.FailedPrecondition, "egress policy must be installed before resume")
+	}
+	wIP := "127.0.0.1:1"
 	if m.workerIP != "" {
 		wIP = m.workerIP
 	}
@@ -156,7 +204,10 @@ func (m *mockControlServer) SuspendActor(ctx context.Context, req *ateapipb.Susp
 		name = req.Actor.Name
 	}
 	m.suspendedActors = append(m.suspendedActors, name)
-	return &ateapipb.SuspendActorResponse{}, nil
+	return &ateapipb.SuspendActorResponse{Actor: &ateapipb.Actor{
+		Metadata: &ateapipb.ResourceMetadata{Name: name},
+		Status:   &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED},
+	}}, nil
 }
 
 func (m *mockControlServer) RevertActor(_ context.Context, req *ateapipb.RevertActorRequest) (*ateapipb.RevertActorResponse, error) {
@@ -242,7 +293,7 @@ func TestTaskReconciler(t *testing.T) {
 	defer client.Close()
 
 	// 3. Reconcile Task
-	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace, "")
+	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace, testDefaultImage)
 	reconciler.SecretResolver = noSecrets
 	reconciler.WorkspaceReadyTimeout = 200 * time.Millisecond
 
@@ -254,7 +305,7 @@ func TestTaskReconciler(t *testing.T) {
 			Atespace: "default",
 		},
 		Spec: &v1alpha1.TaskSpec{
-			Image:   "ghrc.io/my-org/my-image",
+			Image:   "ghrc.io/my-org/my-image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 			Command: []string{"/bin/task-runner"},
 		},
 		// A client-supplied actor name must not survive: the actor is always
@@ -274,8 +325,8 @@ func TestTaskReconciler(t *testing.T) {
 	if reconciled.Status.Actor != "test-task" {
 		t.Errorf("expected actor 'test-task', got %q", reconciled.Status.Actor)
 	}
-	if reconciled.Status.WorkerIp != "10.244.1.42" {
-		t.Errorf("expected worker IP '10.244.1.42', got %q", reconciled.Status.WorkerIp)
+	if reconciled.Status.WorkerIp != "127.0.0.1:1" {
+		t.Errorf("expected worker IP '127.0.0.1:1', got %q", reconciled.Status.WorkerIp)
 	}
 
 	// Verify mock was called
@@ -300,8 +351,8 @@ func TestTaskReconciler_DefaultTaskImage(t *testing.T) {
 		override string
 		want     string
 	}{
-		{name: "api default", want: v1alpha1.DefaultTaskImage},
-		{name: "server override", override: "localhost:5001/ax-task-runner:e2e", want: "localhost:5001/ax-task-runner:e2e"},
+		{name: "configured default", override: testDefaultImage, want: testDefaultImage},
+		{name: "server override", override: "localhost:5001/ax-task-runner:e2e@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", want: "localhost:5001/ax-task-runner:e2e@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			lis, err := net.Listen("tcp", "127.0.0.1:0")
@@ -368,7 +419,7 @@ func TestTaskReconciler_Suspend(t *testing.T) {
 	}
 	defer client.Close()
 
-	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace, "")
+	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace, testDefaultImage)
 	reconciler.SecretResolver = noSecrets
 	reconciler.WorkspaceReadyTimeout = 200 * time.Millisecond
 
@@ -380,7 +431,7 @@ func TestTaskReconciler_Suspend(t *testing.T) {
 			Atespace: "default",
 		},
 		Spec: &v1alpha1.TaskSpec{
-			Image: "ghrc.io/my-org/my-image",
+			Image: "ghrc.io/my-org/my-image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		},
 	}
 
@@ -423,10 +474,10 @@ func TestTaskReconciler_SuspendError(t *testing.T) {
 	}
 	defer client.Close()
 
-	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system", "")
+	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system", testDefaultImage)
 	reconciler.SecretResolver = noSecrets
 
-	workerIp := "10.1.1.1"
+	workerIp := "127.0.0.1:1"
 	task := &v1alpha1.Task{
 		ApiVersion: v1alpha1.APIVersion,
 		Kind:       v1alpha1.KindTask,
@@ -435,7 +486,7 @@ func TestTaskReconciler_SuspendError(t *testing.T) {
 			Atespace: "default",
 		},
 		Spec: &v1alpha1.TaskSpec{
-			Image: "ghrc.io/my-org/my-image",
+			Image: "ghrc.io/my-org/my-image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		},
 		Status: &v1alpha1.TaskStatus{
 			Phase:      "Suspended",
@@ -451,7 +502,8 @@ func TestTaskReconciler_SuspendError(t *testing.T) {
 	if reconciled.GetStatus().GetWorkerIp() != workerIp {
 		t.Errorf("expected worker IP %q to be preserved, got %q", workerIp, reconciled.GetStatus().GetWorkerIp())
 	}
-	assertCondition(t, reconciled, "Ready", "True", "TaskRunning")
+	// Preserve the last observed worker address, but report the failed suspend.
+	assertCondition(t, reconciled, "Ready", "False", "ActorSuspendFailed")
 }
 
 // TestTaskReconciler_TemplateCreationFailed covers google/ax#366: when Substrate
@@ -467,7 +519,7 @@ func TestTaskReconciler_TemplateCreationFailed(t *testing.T) {
 	}
 	defer lis.Close()
 
-	const substrateMsg = `actor_template.containers[0].image: Invalid value: "localhost:5001/my-agent:v1": must be pinned by digest (changing the image invalidates snapshots)`
+	const substrateMsg = `actor_template.containers[0].image: Invalid value: "localhost:5001/my-agent:v1@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": must be pinned by digest (changing the image invalidates snapshots)`
 	mockSrv := &mockControlServer{
 		createTemplateErr: status.Error(codes.InvalidArgument, substrateMsg),
 	}
@@ -482,7 +534,7 @@ func TestTaskReconciler_TemplateCreationFailed(t *testing.T) {
 	}
 	defer client.Close()
 
-	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system", "")
+	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system", testDefaultImage)
 	reconciler.SecretResolver = noSecrets
 	reconciler.WorkspaceReadyTimeout = 200 * time.Millisecond
 
@@ -494,7 +546,7 @@ func TestTaskReconciler_TemplateCreationFailed(t *testing.T) {
 			Atespace: "default",
 		},
 		Spec: &v1alpha1.TaskSpec{
-			Image:   "localhost:5001/my-agent:v1",
+			Image:   "localhost:5001/my-agent:v1@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 			Command: []string{"python3", "/app/agent.py"},
 		},
 		Status: &v1alpha1.TaskStatus{Phase: "Running"},
@@ -560,7 +612,7 @@ func TestTaskReconciler_TemplateCreationTransient(t *testing.T) {
 	}
 	defer client.Close()
 
-	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system", "")
+	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system", testDefaultImage)
 	reconciler.SecretResolver = noSecrets
 	reconciler.WorkspaceReadyTimeout = 200 * time.Millisecond
 
@@ -633,7 +685,7 @@ func TestTaskReconciler_WorkspaceReady(t *testing.T) {
 	}
 	defer client.Close()
 
-	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace, "")
+	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace, testDefaultImage)
 	reconciler.SecretResolver = noSecrets
 	reconciler.WorkspaceReadyTimeout = 200 * time.Millisecond
 
@@ -727,7 +779,7 @@ func TestTaskReconciler_ResourceLimits(t *testing.T) {
 	}
 	defer client.Close()
 
-	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system", "")
+	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system", testDefaultImage)
 	reconciler.SecretResolver = noSecrets
 	reconciler.WorkspaceReadyTimeout = 200 * time.Millisecond
 
@@ -739,7 +791,7 @@ func TestTaskReconciler_ResourceLimits(t *testing.T) {
 			Atespace: "default",
 		},
 		Spec: &v1alpha1.TaskSpec{
-			Image: "ghrc.io/my-org/my-image",
+			Image: "ghrc.io/my-org/my-image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 			Resources: &v1alpha1.ResourcesSpec{
 				Limits: &v1alpha1.ResourceList{Cpu: "2", Memory: "4Gi"},
 			},
@@ -778,18 +830,18 @@ func TestTaskReconciler_ResourceLimits(t *testing.T) {
 		t.Errorf("template resources after change = %v, want %v", got, want)
 	}
 
-	// A task without limits inherits the worker defaults: no resources block.
+	// A task without limits receives both configured AX defaults.
 	plain := &v1alpha1.Task{
 		ApiVersion: v1alpha1.APIVersion,
 		Kind:       v1alpha1.KindTask,
 		Metadata:   &v1alpha1.ObjectMeta{Name: "plain-task", Atespace: "default"},
-		Spec:       &v1alpha1.TaskSpec{Image: "ghrc.io/my-org/my-image"},
+		Spec:       &v1alpha1.TaskSpec{Image: "ghrc.io/my-org/my-image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
 	}
 	if _, err := reconciler.Reconcile(ctx, plain, nil); err != nil {
 		t.Fatalf("Reconcile of task without limits failed: %v", err)
 	}
-	if got := mockSrv.createdTemplates[len(mockSrv.createdTemplates)-1].GetResources(); got != nil {
-		t.Errorf("template for task without limits has resources %v, want none", got)
+	if got := mockSrv.createdTemplates[len(mockSrv.createdTemplates)-1].GetResources(); !proto.Equal(got, substrate.ResourceLimits(nil)) {
+		t.Errorf("template for task without limits has resources %v, want AX defaults", got)
 	}
 }
 
@@ -804,7 +856,7 @@ func TestTaskReconciler_ResourceLimitsFailurePaths(t *testing.T) {
 			ApiVersion: v1alpha1.APIVersion,
 			Kind:       v1alpha1.KindTask,
 			Metadata:   &v1alpha1.ObjectMeta{Name: name, Atespace: "default"},
-			Spec:       &v1alpha1.TaskSpec{Image: "ghrc.io/my-org/my-image", Resources: resources},
+			Spec:       &v1alpha1.TaskSpec{Image: "ghrc.io/my-org/my-image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Resources: resources},
 		}
 	}
 	setup := func(t *testing.T, mockSrv *mockControlServer) *controller.TaskReconciler {
@@ -824,7 +876,7 @@ func TestTaskReconciler_ResourceLimitsFailurePaths(t *testing.T) {
 			grpcServer.Stop()
 			lis.Close()
 		})
-		reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system", "")
+		reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system", testDefaultImage)
 		reconciler.SecretResolver = noSecrets
 		reconciler.WorkspaceReadyTimeout = 200 * time.Millisecond
 		return reconciler
@@ -942,7 +994,7 @@ func TestReconcileDelete_RemovesActorAndTemplates(t *testing.T) {
 	}
 	defer client.Close()
 
-	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace, "")
+	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace, testDefaultImage)
 	reconciler.SecretResolver = noSecrets
 	reconciler.WorkspaceReadyTimeout = 200 * time.Millisecond
 
@@ -1005,7 +1057,7 @@ func TestReconcileDelete_BlocksUntilActorDeleted(t *testing.T) {
 	}
 	defer client.Close()
 
-	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace, "")
+	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace, testDefaultImage)
 	reconciler.SecretResolver = noSecrets
 
 	if err := reconciler.ReconcileDelete(ctx, "default", "slow-delete-task"); err != nil {
@@ -1047,7 +1099,7 @@ func TestReconcileDelete_ActorDeletionTimeout(t *testing.T) {
 	}
 	defer client.Close()
 
-	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace, "")
+	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace, testDefaultImage)
 	reconciler.SecretResolver = noSecrets
 
 	err = reconciler.ReconcileDelete(ctx, "default", "stuck-task")
@@ -1111,7 +1163,7 @@ func TestTaskReconciler_TransientSubstrateUnavailable(t *testing.T) {
 	}
 	defer client.Close()
 
-	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace, "")
+	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace, testDefaultImage)
 	reconciler.SecretResolver = noSecrets
 	reconciler.WorkspaceReadyTimeout = 50 * time.Millisecond
 
@@ -1119,7 +1171,7 @@ func TestTaskReconciler_TransientSubstrateUnavailable(t *testing.T) {
 	mockSrv.createAtespaceErr = status.Error(codes.DeadlineExceeded, "substrate control plane timed out")
 	task := &v1alpha1.Task{
 		Metadata: &v1alpha1.ObjectMeta{Name: "transient-atespace"},
-		Spec:     &v1alpha1.TaskSpec{Image: "ghrc.io/my-org/my-image"},
+		Spec:     &v1alpha1.TaskSpec{Image: "ghrc.io/my-org/my-image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
 	}
 	reconciled, err := reconciler.Reconcile(ctx, task, nil)
 	if err == nil {
@@ -1135,7 +1187,7 @@ func TestTaskReconciler_TransientSubstrateUnavailable(t *testing.T) {
 	mockSrv.createActorErr = status.Error(codes.DeadlineExceeded, "substrate actor creation timed out")
 	task2 := &v1alpha1.Task{
 		Metadata: &v1alpha1.ObjectMeta{Name: "transient-actor"},
-		Spec:     &v1alpha1.TaskSpec{Image: "ghrc.io/my-org/my-image"},
+		Spec:     &v1alpha1.TaskSpec{Image: "ghrc.io/my-org/my-image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
 	}
 	reconciled2, err := reconciler.Reconcile(ctx, task2, nil)
 	if err == nil {
@@ -1152,7 +1204,7 @@ func TestTaskReconciler_TransientSubstrateUnavailable(t *testing.T) {
 	mockSrv.resumeActorErr = status.Error(codes.DeadlineExceeded, "substrate worker pool temporarily unreachable")
 	task3 := &v1alpha1.Task{
 		Metadata: &v1alpha1.ObjectMeta{Name: "transient-resume"},
-		Spec:     &v1alpha1.TaskSpec{Image: "ghrc.io/my-org/my-image"},
+		Spec:     &v1alpha1.TaskSpec{Image: "ghrc.io/my-org/my-image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
 		Status:   &v1alpha1.TaskStatus{Phase: "Running"},
 	}
 	reconciled3, err := reconciler.Reconcile(ctx, task3, nil)
@@ -1179,7 +1231,7 @@ func TestTaskReconciler_TransientSubstrateUnavailable(t *testing.T) {
 	mockSrv.createActorErr = status.Error(codes.InvalidArgument, "invalid actor specification")
 	task4 := &v1alpha1.Task{
 		Metadata: &v1alpha1.ObjectMeta{Name: "permanent-actor-err"},
-		Spec:     &v1alpha1.TaskSpec{Image: "ghrc.io/my-org/my-image"},
+		Spec:     &v1alpha1.TaskSpec{Image: "ghrc.io/my-org/my-image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
 	}
 	reconciled4, err := reconciler.Reconcile(ctx, task4, nil)
 	if err == nil {

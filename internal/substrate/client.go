@@ -26,15 +26,16 @@ import (
 	"strings"
 	"time"
 
-	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
-	"github.com/agent-substrate/substrate/pkg/sandboxclass"
 	"github.com/cenkalti/backoff/v5"
 	"github.com/google/ax/pkg/apis/v1alpha1"
+	"go.ate.dev/substrate/pkg/proto/ateapipb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 // ClientOptions configures connection to the Substrate Control API server.
@@ -45,6 +46,9 @@ type ClientOptions struct {
 	CAFile      string
 	InsecureTLS bool
 	Plaintext   bool
+	Template    TemplateOptions
+	// EgressOrigins is an HTTP(S) origin allowlist; empty denies all egress.
+	EgressOrigins []string
 }
 
 type tokenAuth struct {
@@ -70,12 +74,22 @@ func (t tokenAuth) RequireTransportSecurity() bool {
 
 // Client wraps the Substrate Control API client.
 type Client struct {
-	conn    *grpc.ClientConn
-	control ateapipb.ControlClient
+	conn        *grpc.ClientConn
+	control     ateapipb.ControlClient
+	template    TemplateOptions
+	egressRules []*ateapipb.EgressRule
 }
 
 // NewClientWithOptions connects to Substrate with full TLS and auth configuration.
 func NewClientWithOptions(opts ClientOptions, extraDialOpts ...grpc.DialOption) (*Client, error) {
+	opts.Template = opts.Template.withDefaults()
+	if err := opts.Template.Validate(); err != nil {
+		return nil, err
+	}
+	rules, err := EgressRules(opts.EgressOrigins)
+	if err != nil {
+		return nil, err
+	}
 	if opts.Target == "" {
 		opts.Target = "api.ate-system.svc.cluster.local:443"
 	}
@@ -147,8 +161,10 @@ func NewClientWithOptions(opts ClientOptions, extraDialOpts ...grpc.DialOption) 
 		return nil, fmt.Errorf("failed to connect to Substrate control service at %s: %w", opts.Target, err)
 	}
 	return &Client{
-		conn:    conn,
-		control: ateapipb.NewControlClient(conn),
+		conn:        conn,
+		control:     ateapipb.NewControlClient(conn),
+		template:    opts.Template,
+		egressRules: rules,
 	}, nil
 }
 
@@ -180,8 +196,42 @@ func (c *Client) Close() error {
 	return nil
 }
 
+// Ready waits for the Control API transport to become usable. It does not
+// require global API privileges and is only called by the server readiness probe.
+func (c *Client) Ready(ctx context.Context) error {
+	if c.conn == nil {
+		return fmt.Errorf("Substrate connection is not initialized")
+	}
+	c.conn.Connect()
+	for {
+		state := c.conn.GetState()
+		if state == connectivity.Ready {
+			return nil
+		}
+		if state == connectivity.Shutdown {
+			return fmt.Errorf("Substrate connection is shut down")
+		}
+		if !c.conn.WaitForStateChange(ctx, state) {
+			return fmt.Errorf("Substrate connection is not ready: %w", ctx.Err())
+		}
+	}
+}
+
 // EnsureAtespace creates the atespace if it does not already exist.
 func (c *Client) EnsureAtespace(ctx context.Context, atespace string) error {
+	var err error
+	err = retryOnCodes(ctx, func() error {
+		_, getErr := c.control.GetAtespace(ctx, &ateapipb.GetAtespaceRequest{
+			Atespace: &ateapipb.ObjectRef{Name: atespace},
+		})
+		return getErr
+	}, codes.Unavailable)
+	if err == nil {
+		return nil
+	}
+	if status.Code(err) != codes.NotFound {
+		return fmt.Errorf("getting atespace %q: %w", atespace, err)
+	}
 	req := &ateapipb.CreateAtespaceRequest{
 		Atespace: &ateapipb.Atespace{
 			Metadata: &ateapipb.ResourceMetadata{
@@ -189,7 +239,7 @@ func (c *Client) EnsureAtespace(ctx context.Context, atespace string) error {
 			},
 		},
 	}
-	err := retryOnCodes(ctx, func() error {
+	err = retryOnCodes(ctx, func() error {
 		_, err := c.control.CreateAtespace(ctx, req)
 		return err
 	}, codes.Unavailable)
@@ -218,7 +268,7 @@ func (c *Client) GetActorTemplate(ctx context.Context, atespace, templateName st
 
 const (
 	DefaultGuestCommand    = "/usr/local/bin/ax-task-runner"
-	DefaultSnapshotsBucket = "gs://dberkov-gke-dev3/ate-env/"
+	DefaultSnapshotsBucket = "s3://ate-snapshots/"
 
 	// defaultRetryAttempts is the maximum number of calls retryOnCodes makes. With
 	// exponential backoff from defaultRetryInterval capped at maxRetryInterval
@@ -257,7 +307,7 @@ func IsTransientError(err error) bool {
 	}
 	if st, ok := status.FromError(err); ok {
 		switch st.Code() {
-		case codes.Unavailable, codes.DeadlineExceeded:
+		case codes.Unavailable, codes.DeadlineExceeded, codes.Aborted:
 			return true
 		}
 	}
@@ -293,26 +343,33 @@ func retryOnCodes(ctx context.Context, fn func() error, retryable ...codes.Code)
 
 // ResourceLimits translates a Task's resource limits into the Substrate
 // ActorTemplate resources block. Substrate sizes a sandbox by limits alone
-// (requests are rejected by v1alpha1.ValidateResources). It returns nil when no
-// limit is set so the template inherits the worker defaults.
-func ResourceLimits(reqs *v1alpha1.ResourcesSpec) *ateapipb.Resources {
+// (requests are rejected by v1alpha1.ValidateResources). Missing limits inherit
+// AX's configured defaults; Substrate requires both CPU and memory.
+func ResourceLimits(reqs *v1alpha1.ResourcesSpec, options ...TemplateOptions) *ateapipb.Resources {
+	opts := TemplateOptions{}.withDefaults()
+	if len(options) > 0 {
+		opts = options[0].withDefaults()
+	}
 	limits := reqs.GetLimits()
-	var out []*ateapipb.Limits
-	if cpu := limits.GetCpu(); cpu != "" {
-		out = append(out, &ateapipb.Limits{Name: "cpu", Quantity: cpu})
+	cpu, memory := limits.GetCpu(), limits.GetMemory()
+	if cpu == "" {
+		cpu = opts.DefaultCPU
 	}
-	if memory := limits.GetMemory(); memory != "" {
-		out = append(out, &ateapipb.Limits{Name: "memory", Quantity: memory})
+	if memory == "" {
+		memory = opts.DefaultMemory
 	}
-	if len(out) == 0 {
-		return nil
-	}
-	return &ateapipb.Resources{Limits: out}
+	return &ateapipb.Resources{Limits: []*ateapipb.Limits{
+		{Name: "cpu", Quantity: cpu}, {Name: "memory", Quantity: memory},
+	}}
 }
 
 // BuildActorTemplate constructs a Substrate ActorTemplate based on the standard ate-env specification.
-// A nil resources leaves the sandbox sized by the worker defaults.
-func BuildActorTemplate(atespace, name, image string, envMap map[string]string, command []string, snapshotsBucket string, resources *ateapipb.Resources) *ateapipb.ActorTemplate {
+// A nil resources uses AX's CPU and memory defaults.
+func BuildActorTemplate(atespace, name, image string, envMap map[string]string, command []string, snapshotsBucket string, resources *ateapipb.Resources, options ...TemplateOptions) *ateapipb.ActorTemplate {
+	opts := TemplateOptions{}.withDefaults()
+	if len(options) > 0 {
+		opts = options[0].withDefaults()
+	}
 	if atespace == "" {
 		atespace = "default"
 	}
@@ -323,20 +380,19 @@ func BuildActorTemplate(atespace, name, image string, envMap map[string]string, 
 		command = []string{DefaultGuestCommand}
 	}
 	if snapshotsBucket == "" {
-		if envBucket := os.Getenv("AX_SNAPSHOTS_BUCKET"); envBucket != "" {
-			snapshotsBucket = envBucket
-		} else {
-			snapshotsBucket = DefaultSnapshotsBucket
-		}
+		snapshotsBucket = opts.SnapshotsBucket
 	}
-
-	var envList []*ateapipb.EnvVar
+	if resources == nil {
+		resources = ResourceLimits(nil, opts)
+	}
+	environment := make(map[string]string, len(envMap)+len(trustEnvironment)+1)
 	for k, v := range envMap {
-		envList = append(envList, &ateapipb.EnvVar{
-			Name:  k,
-			Value: v,
-		})
+		environment[k] = v
 	}
+	for _, key := range trustEnvironment {
+		environment[key] = egressTrustMount + "/trust-bundle.pem"
+	}
+	environment["SSL_CERT_DIR"] = egressTrustMount
 
 	return &ateapipb.ActorTemplate{
 		Metadata: &ateapipb.ResourceMetadata{
@@ -347,42 +403,40 @@ func BuildActorTemplate(atespace, name, image string, envMap map[string]string, 
 			Name:    "guest",
 			Image:   image,
 			Command: command,
-			Env:     envList,
+			Env:     sortedEnv(environment),
 			WakeupProbe: &ateapipb.WakeupProbe{
 				HttpGet: &ateapipb.HttpGetAction{
 					Path: "/readyz",
 					Port: 80,
 				},
+				TimeoutSeconds: opts.WakeupTimeoutSeconds,
 			},
-			VolumeMounts: []*ateapipb.VolumeMount{{
-				Name:      "workspace",
-				MountPath: "/workspace",
-			}},
+			VolumeMounts: []*ateapipb.VolumeMount{
+				{Name: "workspace", MountPath: opts.WorkspacePath},
+				{Name: "ax-state", MountPath: "/ax"},
+				{Name: "egress-trust", MountPath: egressTrustMount},
+			},
 		}},
-		Volumes: []*ateapipb.Volume{{
-			Name:       "workspace",
-			DurableDir: &ateapipb.DurableDirVolumeSource{},
-		}},
+		Volumes: []*ateapipb.Volume{
+			{Name: "workspace", DurableDir: &ateapipb.DurableDirVolumeSource{}},
+			{Name: "ax-state", DurableDir: &ateapipb.DurableDirVolumeSource{}},
+			{Name: "egress-trust", SystemInfo: &ateapipb.SystemInfoVolumeSource{DataSources: []*ateapipb.SystemInfoDataSource{
+				{TrustBundle: &ateapipb.TrustBundleDataSource{Names: []string{"egress-mitm.ate.dev", "system-roots.ate.dev"}, Path: "trust-bundle.pem"}},
+			}}},
+		},
 		SnapshotConfig: &ateapipb.SnapshotConfig{
-			StorageLocation:   snapshotsBucket,
-			PreferredFidelity: ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES,
+			StorageLocation:      snapshotsBucket,
+			PreferredFidelity:    ateapipb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES,
+			GoldenSnapshotConfig: &ateapipb.GoldenSnapshotConfig{Mode: ateapipb.GoldenSnapshotMode_GOLDEN_SNAPSHOT_MODE_DISABLED},
 		},
-		SandboxConfig: &ateapipb.SandboxConfig{
-			SandboxClass: sandboxclass.GVisor,
-			ConfigName:   "gvisor-default",
-		},
-		Resources: resources,
+		WorkerSelector: &ateapipb.Selector{MatchLabels: opts.WorkerSelector},
+		Resources:      resources,
 	}
 }
 
 // EnsureActorTemplateWithImage creates an ActorTemplate using the specified container image,
-// resource limits (nil for worker defaults), and optional environment variables.
+// resource limits (nil for AX defaults), and optional environment variables.
 func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, baseAtespace, baseTemplate, targetAtespace, targetTemplate, image string, resources *ateapipb.Resources, extraEnv ...map[string]string) (*ateapipb.ActorTemplate, error) {
-	existing, err := c.GetActorTemplate(ctx, targetAtespace, targetTemplate)
-	if err == nil && existing != nil {
-		return existing, nil
-	}
-
 	envMap := make(map[string]string)
 	for _, envs := range extraEnv {
 		for k, v := range envs {
@@ -390,7 +444,25 @@ func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, baseAtespace,
 		}
 	}
 
-	tmpl := BuildActorTemplate(targetAtespace, targetTemplate, image, envMap, nil, "", resources)
+	tmpl := BuildActorTemplate(targetAtespace, targetTemplate, image, envMap, nil, "", resources, c.template)
+	return c.EnsureActorTemplate(ctx, tmpl)
+}
+
+func (c *Client) EnsureActorTemplate(ctx context.Context, tmpl *ateapipb.ActorTemplate) (*ateapipb.ActorTemplate, error) {
+	if err := validateTemplate(tmpl); err != nil {
+		return nil, err
+	}
+	targetAtespace, targetTemplate := tmpl.GetMetadata().GetAtespace(), tmpl.GetMetadata().GetName()
+	existing, err := c.GetActorTemplate(ctx, targetAtespace, targetTemplate)
+	if err == nil {
+		if !proto.Equal(ActorTemplateSpec(existing), ActorTemplateSpec(tmpl)) {
+			return nil, status.Errorf(codes.FailedPrecondition, "actor template %s/%s exists with different configuration", targetAtespace, targetTemplate)
+		}
+		return existing, nil
+	}
+	if status.Code(err) != codes.NotFound {
+		return nil, err
+	}
 	req := &ateapipb.CreateActorTemplateRequest{
 		ActorTemplate: tmpl,
 	}
@@ -406,7 +478,15 @@ func (c *Client) EnsureActorTemplateWithImage(ctx context.Context, baseAtespace,
 	if created != nil {
 		return created, nil
 	}
-	return c.GetActorTemplate(ctx, targetAtespace, targetTemplate)
+	// A concurrent creator must have stored the same immutable content.
+	existing, err = c.GetActorTemplate(ctx, targetAtespace, targetTemplate)
+	if err != nil {
+		return nil, err
+	}
+	if !proto.Equal(ActorTemplateSpec(existing), ActorTemplateSpec(tmpl)) {
+		return nil, status.Errorf(codes.FailedPrecondition, "actor template %s/%s exists with different configuration", targetAtespace, targetTemplate)
+	}
+	return existing, nil
 }
 
 // EnsureActor creates an Actor in the specified atespace deriving from an ActorTemplate.
@@ -433,6 +513,9 @@ func (c *Client) EnsureActor(ctx context.Context, atespace, actorName, templateA
 		if status.Code(err) == codes.AlreadyExists {
 			existing, getErr := c.GetActor(ctx, atespace, actorName)
 			if getErr == nil && existing != nil {
+				if ref := existing.GetActorTemplate(); ref != nil && (ref.GetAtespace() != templateAtespace || ref.GetName() != templateName) {
+					return nil, status.Errorf(codes.FailedPrecondition, "actor %s/%s uses a different immutable template; create a new task for the changed launch configuration", atespace, actorName)
+				}
 				state := existing.GetStatus().GetState()
 				if state == ateapipb.ActorState_ACTOR_STATE_CRASHED {
 					// Revert to the last snapshot so the workspace survives the crash.
@@ -451,19 +534,7 @@ func (c *Client) EnsureActor(ctx context.Context, atespace, actorName, templateA
 						slog.Warn("existing actor is crashed, reverted to its last snapshot", "actor", actorName)
 						return reverted.GetActor(), nil
 					}
-					slog.Warn("existing actor is crashed and could not be reverted, deleting and recreating", "actor", actorName, "error", revertErr)
-					if err := c.DeleteActor(ctx, atespace, actorName); err != nil {
-						return nil, err
-					}
-					err = retryOnCodes(ctx, func() error {
-						var err error
-						actor, err = c.control.CreateActor(ctx, req)
-						return err
-					}, codes.Unavailable)
-					if err == nil {
-						return actor, nil
-					}
-					return nil, fmt.Errorf("recreating actor %s/%s after crash: %w", atespace, actorName, err)
+					return nil, fmt.Errorf("reverting crashed actor %s/%s; preserving its recovery state: %w", atespace, actorName, revertErr)
 				}
 				if state == ateapipb.ActorState_ACTOR_STATE_DELETING {
 					// Wait briefly for previous actor deletion to finalize before recreating
@@ -525,15 +596,65 @@ func (c *Client) SuspendActor(ctx context.Context, atespace, actorName string) e
 			Atespace: atespace,
 			Name:     actorName,
 		},
+		Options: &ateapipb.SuspendOptions{Mode: ateapipb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS},
 	}
+	var resp *ateapipb.SuspendActorResponse
 	err := retryOnCodes(ctx, func() error {
-		_, err := c.control.SuspendActor(ctx, req)
+		var err error
+		resp, err = c.control.SuspendActor(ctx, req)
 		return err
 	}, codes.Aborted, codes.Unavailable)
 	if err != nil {
 		return fmt.Errorf("suspending actor %s/%s: %w", atespace, actorName, err)
 	}
-	return nil
+	actor := resp.GetActor()
+	if actor == nil {
+		return fmt.Errorf("suspending actor %s/%s: empty response", atespace, actorName)
+	}
+	uid := actor.GetMetadata().GetUid()
+	snapshot := LatestActorSnapshot(actor)
+	// A never-started Actor is initially suspended without a checkpoint.
+	if snapshot == nil && actor.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_SUSPENDED && actor.GetStatus().GetLastAssignedGeneration() == 0 {
+		return nil
+	}
+	generation := snapshot.GetGeneration()
+	for {
+		if actor.GetMetadata().GetUid() != uid || actor.GetStatus().GetState() != ateapipb.ActorState_ACTOR_STATE_SUSPENDED || LatestActorSnapshot(actor).GetGeneration() != generation {
+			return fmt.Errorf("actor %s/%s changed while waiting for its durable snapshot", atespace, actorName)
+		}
+		storage := LatestActorSnapshot(actor).GetDurableSnapshot()
+		switch storage.GetStatus() {
+		case ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_COMPLETED:
+			if storage.GetObject().GetSnapshotUri() == "" {
+				return fmt.Errorf("actor %s/%s has a completed snapshot without an object URI", atespace, actorName)
+			}
+			return nil
+		case ateapipb.SnapshotStorageStatus_SNAPSHOT_STORAGE_STATUS_PENDING:
+		default:
+			return fmt.Errorf("actor %s/%s has no durable snapshot for generation %d", atespace, actorName, generation)
+		}
+		timer := time.NewTimer(defaultRetryInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf("waiting for durable snapshot: %w", ctx.Err())
+		case <-timer.C:
+		}
+		actor, err = c.GetActor(ctx, atespace, actorName)
+		if err != nil {
+			return fmt.Errorf("waiting for durable snapshot: %w", err)
+		}
+	}
+}
+
+func LatestActorSnapshot(actor *ateapipb.Actor) *ateapipb.Snapshot {
+	var latest *ateapipb.Snapshot
+	for _, snapshot := range actor.GetStatus().GetSnapshots() {
+		if snapshot.GetGeneration() > latest.GetGeneration() {
+			latest = snapshot
+		}
+	}
+	return latest
 }
 
 // GetActor fetches an Actor by name.
@@ -615,19 +736,29 @@ func (c *Client) DeleteActor(ctx context.Context, atespace, actorName string) er
 
 // ListActorTemplates returns all ActorTemplates in the given atespace.
 func (c *Client) ListActorTemplates(ctx context.Context, atespace string) ([]*ateapipb.ActorTemplate, error) {
-	var resp *ateapipb.ListActorTemplatesResponse
-	err := retryOnCodes(ctx, func() error {
-		var err error
-		resp, err = c.control.ListActorTemplates(ctx, &ateapipb.ListActorTemplatesRequest{Atespace: atespace})
-		return err
-	}, codes.Unavailable)
-	if err != nil {
-		return nil, fmt.Errorf("listing actor templates in %s: %w", atespace, err)
+	var templates []*ateapipb.ActorTemplate
+	token := ""
+	seen := map[string]bool{}
+	for {
+		var resp *ateapipb.ListActorTemplatesResponse
+		err := retryOnCodes(ctx, func() error {
+			var err error
+			resp, err = c.control.ListActorTemplates(ctx, &ateapipb.ListActorTemplatesRequest{Atespace: atespace, Options: &ateapipb.ListOptions{PageToken: token}})
+			return err
+		}, codes.Unavailable)
+		if err != nil {
+			return nil, fmt.Errorf("listing actor templates in %s: %w", atespace, err)
+		}
+		templates = append(templates, resp.GetActorTemplates()...)
+		if resp.GetNextPageToken() == "" {
+			return templates, nil
+		}
+		if seen[resp.GetNextPageToken()] {
+			return nil, fmt.Errorf("actor template pagination did not advance")
+		}
+		token = resp.GetNextPageToken()
+		seen[token] = true
 	}
-	if resp.GetNextPageToken() != "" {
-		slog.Warn("actor template listing was truncated", "atespace", atespace)
-	}
-	return resp.GetActorTemplates(), nil
 }
 
 // DeleteActorTemplate deletes the specified ActorTemplate. A missing template is not an error.
