@@ -56,6 +56,12 @@ spec:
             - "--substrate-authority=api.ate-system.svc"
             - "--substrate-token-file=/var/run/secrets/ateapi/token"
             - "--substrate-ca-file=/run/servicedns-ca/trust-bundle.pem"
+            - "--default-task-cpu=1"
+            - "--default-task-memory=1Gi"
+            - "--task-wakeup-timeout-seconds=900"
+            - "--worker-pool-name=ax-workers"
+            - "--worker-pool-namespace=${AX_SYSTEM_NAMESPACE}"
+            - "--egress-allow-origins=${AX_EGRESS_ALLOW_ORIGINS}"
             - "--template=default-template"
             - "--template-atespace=${AX_SYSTEM_NAMESPACE}"
           env:
@@ -76,8 +82,9 @@ spec:
               cpu: 1000m
               memory: 1Gi
           readinessProbe:
+            timeoutSeconds: 3
             httpGet:
-              path: /healthz
+              path: /readyz
               port: 8080
             initialDelaySeconds: 2
             periodSeconds: 5

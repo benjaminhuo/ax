@@ -19,13 +19,13 @@
 #
 # Configurable environment variables:
 #   SUBSTRATE_REF            Branch, tag, commit, or Go module version of substrate (default: version in go.mod)
-#   SUBSTRATE_REPO           Git repository URL for substrate (default: https://github.com/agent-substrate/substrate.git)
+#   SUBSTRATE_REPO           Git repository URL for substrate (default: https://github.com/kagent-dev/substrate.git)
 #   SUBSTRATE_DIR            Existing substrate checkout (default: ../substrate if present, else clone to .tmp/substrate)
 #   KIND_CLUSTER_NAME        Name of the Kind cluster (default: ax-e2e)
 #   KUBECONFIG               Path to kubeconfig file (default: .tmp/kubeconfig-${KIND_CLUSTER_NAME})
 #   AX_SYSTEM_NAMESPACE      Kubernetes namespace for AX control plane (default: ax-system)
 #   AX_WORKER_REPLICAS       Number of gVisor worker replicas in the AX WorkerPool (default: 4)
-#   AX_SNAPSHOTS_BUCKET      Snapshot storage bucket URI (default: gs://ate-snapshots/ax/)
+#   AX_SNAPSHOTS_BUCKET      Snapshot storage bucket URI (default: s3://ate-snapshots/ax/)
 #   REGISTRY_ADDR            Local container registry address (default: localhost:5001)
 #   RECREATE_KIND            Set to true to delete and recreate the Kind cluster
 #   FORCE_INSTALL_SUBSTRATE  Set to true to reinstall Substrate even if the commit is unchanged
@@ -44,13 +44,14 @@ export KUBECONFIG="${KUBECONFIG:-${TMP_DIR}/kubeconfig-${KIND_CLUSTER_NAME}}"
 export KUBE_CONTEXT="kind-${KIND_CLUSTER_NAME}"
 export AX_SYSTEM_NAMESPACE="${AX_SYSTEM_NAMESPACE:-ax-system}"
 export AX_WORKER_REPLICAS="${AX_WORKER_REPLICAS:-4}"
-export AX_SNAPSHOTS_BUCKET="${AX_SNAPSHOTS_BUCKET:-gs://ate-snapshots/ax/}"
+export AX_EGRESS_ALLOW_ORIGINS="${AX_EGRESS_ALLOW_ORIGINS-https://github.com,https://*.githubusercontent.com,https://generativelanguage.googleapis.com}"
+export AX_SNAPSHOTS_BUCKET="${AX_SNAPSHOTS_BUCKET:-s3://ate-snapshots/ax/}"
 export REGISTRY_ADDR="${REGISTRY_ADDR:-localhost:5001}"
-SUBSTRATE_REPO="${SUBSTRATE_REPO:-https://github.com/agent-substrate/substrate.git}"
+SUBSTRATE_REPO="${SUBSTRATE_REPO:-https://github.com/kagent-dev/substrate.git}"
 GOARCH="$(go env GOARCH)"
 
 # Default to the Substrate version AX is built against. Go pseudo-versions
-SUBSTRATE_REF="${SUBSTRATE_REF:-$(cd "${REPO_ROOT}" && go list -m -f '{{.Version}}' github.com/agent-substrate/substrate)}"
+SUBSTRATE_REF="${SUBSTRATE_REF:-$(cd "${REPO_ROOT}" && go list -m -f '{{.Version}}' go.ate.dev/substrate)}"
 if [[ "${SUBSTRATE_REF}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-.*-([0-9a-f]{12})$ ]]; then
   SUBSTRATE_REF="${BASH_REMATCH[1]}"
 fi
@@ -74,7 +75,7 @@ k() {
 
 # render_manifest substitutes only the AX_* variables below so any other `$`
 # in the manifests is left untouched.
-MANIFEST_VARS=(AX_SYSTEM_NAMESPACE AX_WORKER_REPLICAS AX_SERVER_IMAGE AX_DEFAULT_TASK_IMAGE AX_SNAPSHOTS_BUCKET)
+MANIFEST_VARS=(AX_SYSTEM_NAMESPACE AX_WORKER_REPLICAS AX_SERVER_IMAGE AX_DEFAULT_TASK_IMAGE AX_SNAPSHOTS_BUCKET AX_EGRESS_ALLOW_ORIGINS)
 render_manifest() {
   local manifest="${E2E_DIR}/manifests/$1"
   if command -v envsubst > /dev/null 2>&1; then
@@ -216,7 +217,7 @@ if [[ "${FORCE_INSTALL_SUBSTRATE:-false}" == "true" ]] ||
   if grep -q -- "--credential-provider" "${SUBSTRATE_WORK_DIR}/hack/install-ate.sh" 2> /dev/null; then
     install_args+=(--credential-provider='{"enabled":false}')
   fi
-  (cd "${SUBSTRATE_WORK_DIR}" && ./hack/install-ate-kind.sh "${install_args[@]}")
+  (cd "${SUBSTRATE_WORK_DIR}" && ATE_API_AUTHZ_BOOTSTRAP_OWNERS="system:serviceaccount:ate-system:ate-client,system:serviceaccount:${AX_SYSTEM_NAMESPACE}:ax-server" ./hack/install-ate-kind.sh "${install_args[@]}")
   k annotate namespace ate-system "substrate-commit=${SUBSTRATE_COMMIT}" --overwrite > /dev/null
 else
   log "Substrate ${SUBSTRATE_COMMIT:0:12} already installed; waiting for ate-api-server..."

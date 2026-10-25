@@ -85,7 +85,7 @@ apply-example:
 
 test:
 	@echo "==> Running tests..."
-	go test -v ./...
+	AX_E2E=false go test -v ./...
 
 # Provision Kind + Substrate + AX, then run the E2E suite. Substrate defaults to
 # the version in go.mod; override with SUBSTRATE_REF=<branch|tag|commit>.
