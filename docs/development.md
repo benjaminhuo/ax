@@ -18,7 +18,7 @@ make push-task-runner      # ...and push it (set TASK_RUNNER_REPO)
 
 ## Test
 
-Runs everything, including the mock Substrate gRPC server, in-memory store validation, and API server tests:
+Runs local unit tests, including the mock Substrate gRPC server, in-memory store validation, and API server tests. `make test` explicitly disables live-cluster E2E:
 
 ```bash
 make test        # or: go test -v ./...

@@ -6,7 +6,7 @@ the manifests and Dockerfiles used to deploy AX for the tests.
 
 The suite exercises real gVisor sandboxes, Substrate's `ate-api-server`,
 in-cluster RustFS snapshot storage, Redis, `ax-server`, `ax-task-runner`, and
-the `ax` CLI, against a configurable Substrate branch, tag, or commit.
+the `ax` CLI, against kagent Substrate `v0.6.0-alpha3` by default. Other refs are explicit experiments and are not implied to be SDK-compatible.
 
 | Path | Purpose |
 |---|---|
@@ -15,6 +15,8 @@ the `ax` CLI, against a configurable Substrate branch, tag, or commit.
 | `manifests/` | Namespace, WorkerPool, Redis, and ax-server manifests (rendered with `envsubst`) |
 | `Dockerfile.server` | ax-server image |
 | `Dockerfile.task-runner.e2e` | Extends `Dockerfile.task-runner` with test fixtures (a sample Git repo) |
+
+The E2E scripts create/connect to Kubernetes and are **not part of local unit or chart checks**.
 
 ## Quick Start
 
@@ -56,12 +58,13 @@ resolved values the tests need to `.tmp/e2e.env`.
 |---|---|---|
 | `SUBSTRATE_REF` | version in `go.mod` | Substrate branch, tag, commit, or Go module version |
 | `SUBSTRATE_DIR` | `../substrate` if present | Local Substrate checkout. If its `HEAD` is not `SUBSTRATE_REF`, a detached worktree is created under `.tmp/` |
-| `SUBSTRATE_REPO` | `https://github.com/agent-substrate/substrate.git` | Cloned into `.tmp/substrate` when no local checkout exists |
+| `SUBSTRATE_REPO` | `https://github.com/kagent-dev/substrate.git` | Cloned into `.tmp/substrate` when no local checkout exists |
 | `KIND_CLUSTER_NAME` | `ax-e2e` | Kind cluster name |
 | `KUBECONFIG` | `.tmp/kubeconfig-${KIND_CLUSTER_NAME}` | Kubeconfig for the Kind cluster |
 | `AX_SYSTEM_NAMESPACE` | `ax-system` | Namespace for `ax-redis`, `ax-server`, and the `ax-workers` WorkerPool |
 | `AX_WORKER_REPLICAS` | `4` | gVisor worker replicas |
-| `AX_SNAPSHOTS_BUCKET` | `gs://ate-snapshots/ax/` | Snapshot location in Substrate's in-cluster RustFS |
+| `AX_SNAPSHOTS_BUCKET` | `s3://ate-snapshots/ax/` | Snapshot location in Substrate's in-cluster RustFS |
+| `AX_EGRESS_ALLOW_ORIGINS` | GitHub, GitHub user content, Gemini origins | Comma-separated HTTP(S)/TLS allowlist; explicitly empty denies all egress |
 | `RECREATE_KIND` | `false` | Delete and recreate the Kind cluster |
 | `FORCE_INSTALL_SUBSTRATE` | `false` | Reinstall Substrate even if the requested commit is already installed |
 | `CLEANUP_KIND` | `false` | `hack/run-e2e-kind.sh` only: delete the cluster on exit |

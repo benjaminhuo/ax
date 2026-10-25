@@ -141,33 +141,36 @@ AX 当前客户端不支持 kagent controller 使用的 Pod 客户端证书，�
 命名空间的 `ate.dev/api-access: "true"` 标签用于通过 Substrate 的 API NetworkPolicy，不能替代 API 授权。
 镜像仓库需要能被 Kubernetes 节点及 Substrate 的镜像拉取路径访问；私有仓库按各自运行环境配置拉取凭据。
 
-### RustFS 快照配置
+### Substrate v0.6.0-alpha3 运行配置
 
-`AX_SNAPSHOTS_BUCKET=s3://ate-snapshots/` 使用 S3 URI，指向 Substrate Helm chart 默认创建的 RustFS bucket。
-Substrate Chart 默认生成 `gs://ate-snapshots/`，需要在已有 release 的 Helm values 中显式设置：
+本分支固定 kagent fork 的 Substrate v0.6.0-alpha3（配套 kagent v1.0.0-alpha17）。
+源码已迁移到 `go.ate.dev/substrate/pkg/proto/ateapipb`，资源仍使用字符串数量的 `Resources{Limits: ...}`。
+CPU、内存必须同时存在；未指定的项由 AX 的 `--default-task-cpu=1`、`--default-task-memory=1Gi` 补齐。
+YAML 中 server Pod 的 resources 不会替代任务沙箱资源。
 
-```yaml
-ateApi:
-  snapshotLocation: s3://ate-snapshots/
-```
+快照位置由每个 ActorTemplate 的 `snapshot_config.storage_location` 指定；清单使用 `AX_SNAPSHOTS_BUCKET=s3://ate-snapshots/`。
+alpha3 没有 Substrate Chart 的 `ateApi.snapshotLocation` 配置，也没有 `PerTemplateSnapshotLocation` 开关。
+RustFS endpoint、AWS 区域、path style 和凭据由 Substrate 的 control/node objectstore 插件管理，AX 不直接访问 RustFS。
+URI 的 bucket 必须已经创建；不要把 S3 URI 替换成 RustFS 的 HTTP endpoint。
 
-使用与已安装 release 一致的 chart 版本合并该配置并升级，使
-`ate-system/ate-api-server-envvars` 中的 `ATE_API_SNAPSHOT_LOCATION` 同步为 `s3://ate-snapshots/`。
-快照 URI 与对象存储服务端点是两个独立配置，不能将快照 URI 替换成 RustFS 的 HTTP 地址。
-`http://rustfs.ate-system.svc:9000`、AWS 区域及凭据由 Substrate 的 control/node objectstore 插件配置，
-AX 仅通过 Control API 提交快照存储位置，不直接读写 RustFS，也不需要 RustFS 的账号或密码。
-如果安装时修改了 bucket，请同步核对 `ate-system/ate-api-server-envvars` 的 `ATE_API_SNAPSHOT_LOCATION`。
-未开启 `PerTemplateSnapshotLocation` 预览特性时，服务端使用自身的集群级快照位置；
-开启后才使用 AX 提交的模板级位置，因此需要同步设置服务端与 AX 的配置。
+清单通过 `--worker-pool-name=kagent-default` 和 `--worker-pool-namespace=kagent` 选择现有池。
+模板不再设置 SandboxConfig；运行时由所选 WorkerPool 决定。
+`--egress-allow-origins` 是出站允许列表，按实际 Git、模型服务和依赖下载主机调整；空列表拒绝所有出站访问。
+HTTP(S) 目标仅填写 origin，允许 `https://*.example.com` 形式的单标签通配符；`tls://host:port` 可选择 TLS 透传。
+AX 在 Resume 前创建或更新 Actor 策略，配置 HTTPS 拦截所需的动态 CA，不将集群 CA 烘焙进镜像。
+
+模板关闭 golden snapshot，以避免预热运行真实 Task；工作区和 `/ax` 各有持久卷。
+`--task-wakeup-timeout-seconds=900` 为最长十分钟的工作区 bootstrap 留出时间。
+VOLUMES 快照保留持久卷内容，根文件系统和进程不保证恢复；工具链应预装进 runner 或安装到持久目录。
+暂停成功表示最新快照已完成上传；初始未运行的暂停任务除外。
 
 ### Substrate API 授权
 
-kagent 安装器默认只把 `spiffe://cluster.local/ns/kagent/sa/kagent-controller`
-设为 bootstrap owner，AX 的 JWT principal 是 `system:serviceaccount:ax-system:ax-server`。
-清单中的 Kubernetes ClusterRole 只允许读取模型 Secret，不会授予 Substrate API 权限。
-AX 每次协调任务都会调用 `CreateAtespace`，因此仅授予某个 atespace 的 editor 权限还不够。
+AX 默认 JWT principal 是 `system:serviceaccount:ax-system:ax-server`。
+Kubernetes ClusterRole 仅用于读取模型 Secret，不授予 Substrate API 权限。
+AX 先 GetAtespace，仅在 NotFound 时 Create；预先创建的 atespace 可以按 scoped editor 授权，自动创建需要全局创建权限。
 
-在 Substrate release 的现有 Helm values 中保留全部已有 owner，并加入 AX principal，例如默认安装为：
+如果使用 bootstrap owner 配置方式，将以下配置合并到**已有 Substrate release**，保留所有原有 owner：
 
 ```yaml
 ateApi:
@@ -177,33 +180,12 @@ ateApi:
       - system:serviceaccount:ax-system:ax-server
 ```
 
-使用与已安装 release 一致的 chart 版本合并这些 values，再升级 release；
-或者由现有 owner 通过 Substrate GlobalAccessPolicy 授予 AX global owner。
-这两种授权都覆盖所有 atespaces，与 AX 当前自动创建 atespace 的实现有关。
-本目录不会自动更改已安装的 Substrate release 或授权策略，也不会借用 kagent controller 的身份。
+也可以由现有 owner 通过 AccessPolicy 授权，避免扩大 bootstrap owner 列表。
+部署前必须使用本分支重新构建的 ax-server；尚未验证任何已发布镜像或集群运行兼容性。
+AX 在启动时校验默认 runner 的 digest，因此必须先把清单中的标签替换为真实的多架构 index digest。
+`/readyz` 检查 Redis/Substrate 连接，`/healthz` 只检查进程。
 
-### 当前源码的 API 兼容性前提
-
-只修改部署清单不能保证当前 AX 与工作区的定制 Substrate 完整兼容：
-
-- AX `go.mod` 使用 `github.com/agent-substrate/substrate v0.5.0`，
-  当前定制仓库模块为 `go.ate.dev/substrate`。AX 的 `internal/substrate/client.go`
-  仍构造旧的 `Resources{Limits: []*Limits{Name, Quantity}}`；
-  定制服务端要求 `ResourceRequirements{Limits: Resources{cpu_millicores, memory_bytes}}`，且 CPU、内存均必填。
-  需要适配客户端 protobuf/资源转换并重新发布 ax-server，YAML 中的 Pod resources 不能替代 ActorTemplate resources。
-- 定制服务端校验 ActorTemplate 容器镜像必须带 digest。
-  runner 仍可发布 `latest` 标签，但部署前必须将 `AX_DEFAULT_TASK_IMAGE` 改为
-  `docker.io/benjaminhuo/ax-task-runner:latest@sha256:<实际双架构索引摘要>`。
-  显式填写的 `Task.spec.image`（包括 `examples/task.yaml`）同样需要有效 digest。
-  ax-server 自身是 Kubernetes Pod，其 `latest` 标签不受此项 ActorTemplate 校验影响。
-- kagent 已安装 `kagent/kagent-default` WorkerPool；AX 的模板当前没有 workerSelector，
-  不会按 kagent 的池标签显式限定到该池。如需专用或固定 WorkerPool，需要在 AX 模板构建逻辑中设置 selector。
-  当前 AX 会为任务自行创建模板，修改 `--template-atespace` 不会为这些模板增加 selector。
-
-以上结论基于本地 `~/src/ai/kagent/kagent` 与 `~/src/ai/kagent/substrate` 源码；
-实际安装版本还需核对。尚未执行构建、集群部署或端到端任务验证。
-
-满足上述授权、镜像摘要和 API 兼容性前提，且镜像构建、推送完成后执行：
+满足上述授权、镜像摘要和运行配置前提，且镜像构建、推送完成后执行：
 
 ```bash
 kubectl apply -f dist/redis.yaml

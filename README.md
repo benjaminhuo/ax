@@ -66,7 +66,7 @@ AX schedules every task as a sandboxed actor on [Agent Substrate](https://github
 - [Go](https://go.dev/doc/install) and `kubectl`
 - [`ko`](https://ko.build/) (`brew install ko`) and a container registry your cluster can pull from
 
-To install Agent Substrate, follow the instructions in the [Substrate README](https://github.com/agent-substrate/substrate#readme). Substrate lands in the `ate-system` namespace and exposes its Control API at `api.ate-system.svc.cluster.local:443`, which is where AX expects to find it. Verify it is up before moving on:
+To install Agent Substrate, follow the instructions in the [Substrate README](https://github.com/kagent-dev/substrate/tree/v0.6.0-alpha3#readme). Substrate lands in the `ate-system` namespace and exposes its Control API at `api.ate-system.svc.cluster.local:443`, which is where AX expects to find it. Verify it is up before moving on:
 
 ```bash
 kubectl get svc api -n ate-system
@@ -75,7 +75,7 @@ kubectl get svc api -n ate-system
 ### 1. Install the CLI
 
 ```bash
-go install github.com/google/ax/cmd/ax@latest
+go install ./cmd/ax
 ```
 
 This puts the `ax` binary in `$(go env GOPATH)/bin`. Make sure that directory is on your `PATH`.
@@ -107,6 +107,10 @@ ax resume task task123               # pick up where it left off
 ```
 
 Want to see the whole lifecycle end to end? Run [`./demo.sh`](demo.sh). It applies a custom workspace, waits for readiness, runs commands over `ax ssh`, and suspends the task.
+
+## Substrate compatibility
+
+This branch targets [kagent Substrate v0.6.0-alpha3](https://github.com/kagent-dev/substrate/tree/v0.6.0-alpha3), as used by kagent v1.0.0-alpha17. Build AX images from this branch and configure a digest-pinned runner, WorkerPool, S3 snapshot location, and egress allowlist. See the [Helm deployment guide](charts/ax/README.md).
 
 ## Documentation
 

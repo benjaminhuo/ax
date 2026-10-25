@@ -15,7 +15,7 @@ metadata:
   name: task123
   atespace: default
 spec:
-  image: "ghcr.io/my-org/my-agent-image"
+  # Omit image to use the digest-pinned server default; otherwise use repo@sha256:<digest>.
   command: ["python", "agent.py"]
   env:
     - name: ENVIRONMENT
@@ -36,7 +36,7 @@ spec:
 
 ### Image references
 
-Substrate requires `spec.image` to be pinned by digest, e.g. `ghcr.io/my-org/my-agent-image@sha256:...`. A tag-only reference such as `my-agent:v1` is rejected when the task's ActorTemplate is created, because a tag can move and would silently invalidate the actor's snapshots. If that happens the task reports `Ready=False` with reason `TemplateCreationFailed` and the Substrate error as the message. Resolve a tag to its digest with `docker buildx imagetools inspect <image:tag>` or `crane digest <image:tag>`.
+Substrate requires `spec.image` to be pinned by digest, e.g. `ghcr.io/my-org/my-agent-image@sha256:...`. A tag-only reference such as `my-agent:v1` is rejected by AX validation before the task is stored, because a tag can move and would silently invalidate the actor's snapshots. Resolve a tag to its digest with `docker buildx imagetools inspect <image:tag>` or `crane digest <image:tag>`.
 
 ### Binding a workspace
 
@@ -46,7 +46,7 @@ To work on content from several sources, put it all in one `Workspace`, for exam
 
 ### Sizing the sandbox
 
-`spec.resources.limits` caps the CPU and memory of the task's sandbox. The controller copies the limits onto the Substrate `ActorTemplate` it provisions for the task, using Kubernetes quantity syntax (`500m`, `2`, `4Gi`). Only `cpu` and `memory` are supported, each quantity must be greater than zero, and the CPU limit must be below 1000 cores. `ax apply` rejects values outside these rules, and a task whose limits Substrate refuses is marked `Failed` with reason `TemplateCreationFailed` rather than run without them. A task without limits is sized by its worker's defaults.
+`spec.resources.limits` caps the CPU and memory of the task's sandbox. The controller copies the limits onto the Substrate `ActorTemplate` it provisions for the task, using Kubernetes quantity syntax (`500m`, `2`, `4Gi`). Only `cpu` and `memory` are supported, each quantity must be greater than zero, and the CPU limit must be below 1000 cores. `ax apply` rejects values outside these rules, and a task whose limits Substrate refuses is marked `Failed` with reason `TemplateCreationFailed` rather than run without them. Missing CPU or memory limits inherit the AX server defaults (`1` CPU and `1Gi` memory unless configured otherwise); both effective limits are sent to Substrate.
 
 Substrate sizes sandboxes by limits alone, so `spec.resources.requests` is not supported and `ax apply` rejects a manifest that sets it.
 
