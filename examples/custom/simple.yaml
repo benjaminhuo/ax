@@ -1,0 +1,33 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The smallest useful Task: no Workspace or Model.
+#
+# The task runs on the image pinned below with an empty
+# /workspace directory.
+#
+#   ax apply -f examples/custom/simple.yaml
+#   ax describe task simple-task
+#   ax ssh simple-task -- ls -la /workspace
+apiVersion: ax.io/v1alpha1
+kind: Task
+metadata:
+  name: simple-task
+  atespace: default
+spec:
+  image: "docker.io/benjaminhuo/ax-task-runner@sha256:51a08a6574f572a16fa70ea66fc8419bac336f81016e539524e401cfb3deebb8"
+  env:
+    - name: ENVIRONMENT
+      value: "test"
+  debug: true # serve guest services so `ax ssh` works; off by default

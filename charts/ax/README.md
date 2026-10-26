@@ -4,6 +4,29 @@
 本分支适配 **kagent Substrate v0.6.0-alpha3**（与 kagent v1.0.0-alpha17 的默认依赖一致）。
 必须使用本分支重新发布的 AX 镜像；尚未执行集群集成验证。Chart 不执行镜像构建。
 
+## 安装 CLI
+
+在 AX 仓库的适配分支上执行：
+
+```bash
+cd ~/src/ai/kagent/ax
+git switch kagent-substrate-v0.6.0-alpha3
+make install
+```
+
+`make install` 调用 `go install`，自动编译并安装本分支的 `ax` CLI，**无需先运行 `make build`**。
+`make build` 用于生成仓库内的 `bin/ax` 和 `bin/ax-server`；仅安装 CLI 时不需要这一步。
+安装目录为 `GOBIN`，未设置时默认为 `$(go env GOPATH)/bin`。使用默认目录时，可执行：
+
+```bash
+export PATH="$(go env GOPATH)/bin:$PATH"
+command -v ax
+```
+
+若自定义了 `GOBIN`，则将该目录加入 `PATH`，并确认 `command -v ax` 指向本次安装的二进制。
+使用本分支 CLI 可保持与 ax-server 的 API 一致，并支持下文的生命周期超时配置。
+`go install github.com/google/ax/cmd/ax@latest` 安装的是官方发布版，不能保证与本分支的 API 兼容。
+
 ## 准备镜像与运行配置
 
 使用 `../../dist/scripts` 中的脚本发布 amd64/arm64 镜像，并取得 runner 的多架构 **index digest**。
